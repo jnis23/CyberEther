@@ -1,16 +1,30 @@
 #include "stream_buffer.hh"
 
+#include <utility>
+
 #include "jetstream/logger.hh"
 
 namespace Jetstream::Radio {
 
-Result StreamBuffer::resize(const U64 capacity) {
+Result StreamBuffer::resize(const U64 capacity, const U64 channelCount) {
     std::lock_guard lock(mutex);
+    if (channelCount < 1 || channelCount > 2) {
+        JST_ERROR("[SDR] Stream buffer requires one or two channels; received {}.",
+                  channelCount);
+        return Result::ERROR;
+    }
+    Tools::CircularBuffer<CF32> replacement;
+    Tools::CircularBuffer<CF32> replacement2;
+    JST_CHECK(replacement.resize(capacity));
+    JST_CHECK(replacement2.resize(channelCount == 2 ? capacity : 0));
+    samples = std::move(replacement);
+    samples2 = std::move(replacement2);
+    channels = channelCount;
     accumulated = {};
     written = 0;
     breaks.clear();
     expected.reset();
-    return samples.resize(capacity);
+    return Result::SUCCESS;
 }
 
 void StreamBuffer::reset(const Metadata& metadata) {
@@ -19,6 +33,7 @@ void StreamBuffer::reset(const Metadata& metadata) {
     accumulated.pushedSamples += stats.pushedElements;
     accumulated.overwrittenSamples += stats.overwrittenElements;
     static_cast<void>(samples.clear());
+    static_cast<void>(samples2.clear());
     current = metadata;
     written = 0;
     breaks.clear();
@@ -27,7 +42,17 @@ void StreamBuffer::reset(const Metadata& metadata) {
 
 bool StreamBuffer::push(const U64 generation, const CF32* data, const U64 count,
                         const std::optional<U64> timestamp, const U64 epoch) {
+    return push(generation, data, nullptr, count, timestamp, epoch);
+}
+
+bool StreamBuffer::push(const U64 generation, const CF32* data, const CF32* data2,
+                        const U64 count, const std::optional<U64> timestamp,
+                        const U64 epoch) {
     std::lock_guard lock(mutex);
+    if ((count > 0 && data == nullptr) || (channels == 2) != (data2 != nullptr)) {
+        JST_ERROR("[SDR] Invalid stream buffer input for {} channels.", channels);
+        return false;
+    }
     if (generation != current.generation) {
         accumulated.rejectedSamples += count;
         return false;
@@ -40,6 +65,9 @@ bool StreamBuffer::push(const U64 generation, const CF32* data, const U64 count,
         expectedEpoch = epoch;
     }
     if (samples.push(data, count) != Result::SUCCESS) {
+        return false;
+    }
+    if (channels == 2 && samples2.push(data2, count) != Result::SUCCESS) {
         return false;
     }
     written += count;
@@ -57,11 +85,22 @@ void StreamBuffer::split(const U64 generation) {
 }
 
 Result StreamBuffer::pop(CF32* data, const U64 count, Metadata& metadata) {
+    return pop(data, nullptr, count, metadata);
+}
+
+Result StreamBuffer::pop(CF32* data, CF32* data2, const U64 count, Metadata& metadata) {
     std::lock_guard lock(mutex);
+    if ((count > 0 && data == nullptr) || (channels == 2) != (data2 != nullptr)) {
+        JST_ERROR("[SDR] Invalid stream buffer output for {} channels.", channels);
+        return Result::ERROR;
+    }
     prune();
     while (!breaks.empty() && breaks.front() - (written - samples.size()) < count) {
         const U64 fragment = breaks.front() - (written - samples.size());
         JST_CHECK(samples.discard(fragment));
+        if (channels == 2) {
+            JST_CHECK(samples2.discard(fragment));
+        }
         accumulated.discardedSamples += fragment;
         breaks.pop_front();
     }
@@ -69,6 +108,9 @@ Result StreamBuffer::pop(CF32* data, const U64 count, Metadata& metadata) {
         return Result::INCOMPLETE;
     }
     JST_CHECK(samples.pop(data, count));
+    if (channels == 2) {
+        JST_CHECK(samples2.pop(data2, count));
+    }
     metadata = current;
     return Result::SUCCESS;
 }

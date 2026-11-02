@@ -45,6 +45,7 @@ struct Script {
     F64 frequencyOffset = 0.0;
     std::optional<Radio::Device::Firmware> firmware;
     std::vector<Radio::Device::Range> sampleRates;
+    U64 receiveChannels = 1;
     U64 readLimit = 0;
     std::chrono::milliseconds readDelay{0};
     std::atomic<U64> largestRead{0};
@@ -66,6 +67,7 @@ struct Script {
         frequencyOffset = 0.0;
         firmware.reset();
         sampleRates.clear();
+        receiveChannels = 1;
         readLimit = 0;
         readDelay = std::chrono::milliseconds(0);
         largestRead = 0;
@@ -110,6 +112,7 @@ inline Radio::Device::Capabilities ScriptedCapabilities() {
     caps.usableBandwidth = 0.75;
     caps.dcExclusion = 0.0;
     std::lock_guard lock(TestScript().mutex);
+    caps.receiveChannels = TestScript().receiveChannels;
     caps.firmwareSweep = TestScript().firmware;
     if (TestScript().firmware) {
         caps.sampleRateRanges = {{1.0e6, 20.0e6}};
@@ -234,6 +237,26 @@ class ScriptedStream final : public Radio::Stream {
                              appliedSettings.sampleRate);
     }
 
+    Radio::Device::Capture readChannels(
+        std::span<std::span<CF32>> samples,
+        const std::chrono::milliseconds timeout) override {
+        if (samples.size() == 1) {
+            return read(samples.front(), timeout);
+        }
+        if (samples.size() != 2 || requestedSettings.receiveChannels != 2 ||
+            samples[0].size() != samples[1].size()) {
+            return {.status = Radio::Device::Status::Failure,
+                    .error = "invalid channels"};
+        }
+        auto capture = read(samples[0], timeout);
+        if (capture.status == Radio::Device::Status::Samples) {
+            for (U64 i = 0; i < capture.count; ++i) {
+                samples[1][i] = -samples[0][i];
+            }
+        }
+        return capture;
+    }
+
  protected:
     Result apply(const Settings& settings) override {
         const auto call = jst::fmt::format("configure:{:.0f}", settings.frequency / 1e6);
@@ -252,6 +275,10 @@ class ScriptedStream final : public Radio::Stream {
         appliedSettings.automaticGain = settings.automaticGain;
         appliedSettings.gain = resolveGain(settings.gain, appliedSettings.gainRange);
         appliedSettings.biasTee = settings.biasTee;
+        if (settings.receiveChannels == 2) {
+            appliedSettings.gainRange2 = Radio::Device::Range{5.0, 55.0};
+            JST_CHECK(setSecondGain(settings.automaticGain2, settings.gain2));
+        }
         return Result::SUCCESS;
     }
 
@@ -301,6 +328,19 @@ class ScriptedStream final : public Radio::Stream {
         }
         requestedSettings.gain = gain;
         appliedSettings.gain = resolveGain(gain, appliedSettings.gainRange);
+        return Result::SUCCESS;
+    }
+
+    Result setSecondGain(const bool automatic, const F64 gain) override {
+        const auto call = jst::fmt::format("gain2:{:.0f}", gain);
+        TestScript().record(call);
+        if (TestScript().fails(call)) {
+            return Result::ERROR;
+        }
+        requestedSettings.automaticGain2 = automatic;
+        requestedSettings.gain2 = gain;
+        appliedSettings.automaticGain2 = automatic;
+        appliedSettings.gain2 = resolveGain(gain, appliedSettings.gainRange2);
         return Result::SUCCESS;
     }
 

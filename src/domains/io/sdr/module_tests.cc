@@ -2086,3 +2086,154 @@ TEST_CASE_METHOD(ScriptedFlowgraph,
     REQUIRE(viewBlock("radio").state == Block::State::Incomplete);
     REQUIRE(TestScript().opens == 1);
 }
+
+TEST_CASE_METHOD(
+    ScriptedDrivers,
+    "Dual RX modules publish aligned outputs across retunes and rate changes",
+    "[modules][sdr][dual-rx]") {
+    TestScript().receiveChannels = 2;
+    TestScript().counter = true;
+    TestScript().budget = 12;
+    auto config = ScriptedConfig();
+    config.dualRx = true;
+    config.automaticGain = false;
+    config.manualGain = 12.0f;
+    config.automaticGain2 = false;
+    config.manualGain2 = 19.0f;
+    const auto module = BuildSdrModule();
+    const ModuleCleanup cleanup{module};
+    REQUIRE(module->create("dual", config, {}) == Result::SUCCESS);
+    auto* sdr = module->getImpl<Modules::SdrImpl>();
+    const auto& queue = sdr->*SdrImplAccess::streamMember();
+    const auto runtime = RuntimeOf(module);
+    const auto& first = module->outputs().at("signal").tensor;
+    const auto& second = module->outputs().at("signal2").tensor;
+    REQUIRE(first.shape() == second.shape());
+    REQUIRE(second.shape() == Shape{1, 8});
+    REQUIRE(sdr->getGainRange(true)->minimum == 5.0);
+    REQUIRE(sdr->getApplied().gain == 12.0);
+    REQUIRE(sdr->getApplied().gain2 == 19.0);
+
+    const auto checkFrame = [&] {
+        REQUIRE(WaitFor([&] { return queue.size() >= 8; }));
+        REQUIRE(runtime->computeSubmit() == Result::SUCCESS);
+        for (U64 i = 0; i < first.size(); ++i) {
+            REQUIRE(second.data<CF32>()[i] == -first.data<CF32>()[i]);
+        }
+        REQUIRE(AttributeOf(first, "frequency") == AttributeOf(second, "frequency"));
+        REQUIRE(AttributeOf(first, "sampleRate") == AttributeOf(second, "sampleRate"));
+    };
+    checkFrame();
+    REQUIRE(WaitFor([&] { return sdr->getThroughput().second == 32.0f; }));
+    REQUIRE(WaitFor([&] { return queue.size() == 4; }));
+    REQUIRE(module->reconfigure({{"frequency", F32{250.0e6}}}) == Result::SUCCESS);
+    REQUIRE(queue.size() == 0);
+    TestScript().budget = 8;
+    checkFrame();
+    REQUIRE(AttributeOf(second, "frequency") == 250.0e6f);
+    REQUIRE(module->reconfigure({{"sampleRate", F32{4.0e6}}}) == Result::SUCCESS);
+    TestScript().budget = 8;
+    checkFrame();
+    REQUIRE(AttributeOf(second, "sampleRate") == 4.0e6f);
+    REQUIRE(module->reconfigure({{"manualGain2", F32{25.0}}}) == Result::SUCCESS);
+    REQUIRE(sdr->getApplied().gain == 12.0);
+    REQUIRE(sdr->getApplied().gain2 == 25.0);
+}
+
+TEST_CASE_METHOD(
+    ScriptedFlowgraph,
+    "Dual RX blocks expose RX2 and preserve its connection through mode changes",
+    "[modules][sdr][dual-rx][block]") {
+    TestScript().receiveChannels = 2;
+    TestScript().budget = 0;
+    Blocks::Sdr config;
+    config.deviceString = Selector;
+    config.numberOfBatches = 1;
+    config.numberOfTimeSamples = 8;
+    REQUIRE(flowgraph->blockCreate("radio", config, {}) == Result::SUCCESS);
+    REQUIRE(viewBlock("radio").state == Block::State::Created);
+    auto block = viewBlock("radio");
+    REQUIRE(std::any_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
+                        [](const auto& field) { return field.name == "dualRx"; }));
+    REQUIRE_FALSE(block.outputs.contains("signal2"));
+    REQUIRE(flowgraph->blockReconfigure(
+                "radio", {{"dualRx", true}, {"automaticGain2", false}}) ==
+            Result::SUCCESS);
+    block = viewBlock("radio");
+    REQUIRE(block.state == Block::State::Created);
+    REQUIRE(block.outputs.contains("signal"));
+    REQUIRE(block.outputs.contains("signal2"));
+    REQUIRE(std::none_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
+                         [](const auto& field) { return field.name == "antenna"; }));
+    REQUIRE(std::any_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
+                        [](const auto& field) { return field.name == "manualGain2"; }));
+    const auto rx2Gain =
+        std::find_if(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
+                     [](const auto& field) { return field.name == "manualGain2"; });
+    REQUIRE(rx2Gain != block.interfaceConfigs.end());
+    REQUIRE(Parser::Get<F32>(rx2Gain->format, "min") == 5.0f);
+    REQUIRE(Parser::Get<F32>(rx2Gain->format, "max") == 55.0f);
+    REQUIRE(flowgraph->blockCreate("consumer", "flowgraph_test_pass", {}, {}) ==
+            Result::SUCCESS);
+    REQUIRE(flowgraph->blockConnect("consumer", "buffer", "radio", "signal2") ==
+            Result::SUCCESS);
+    REQUIRE(viewBlock("consumer").state == Block::State::Created);
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"dualRx", false}}) ==
+            Result::SUCCESS);
+    REQUIRE_FALSE(viewBlock("radio").outputs.contains("signal2"));
+    REQUIRE(viewBlock("consumer").state != Block::State::Created);
+    REQUIRE(viewBlock("consumer").inputs.contains("buffer"));
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"dualRx", true}}) ==
+            Result::SUCCESS);
+    REQUIRE(viewBlock("radio").state == Block::State::Created);
+    REQUIRE(viewBlock("consumer").state == Block::State::Created);
+}
+
+TEST_CASE_METHOD(ScriptedDrivers,
+                 "Dual RX configuration fails clearly on single RX radios",
+                 "[modules][sdr][dual-rx][compatibility]") {
+    auto config = ScriptedConfig();
+    config.dualRx = true;
+    const auto module = BuildSdrModule();
+    REQUIRE(module->create("dual", config, {}) == Result::ERROR);
+    REQUIRE(JST_LOG_LAST_ERROR().find("does not support Dual RX") != std::string::npos);
+    REQUIRE(module->state() == Module::State::DESTROYED);
+}
+
+TEST_CASE_METHOD(ScriptedDrivers,
+                 "Dual RX startup failures release the radio and shared antenna power",
+                 "[modules][sdr][dual-rx][lifecycle]") {
+    TestScript().receiveChannels = 2;
+    TestScript().failAt = "gain2:30";
+    auto config = ScriptedConfig();
+    config.dualRx = true;
+    config.biasTee = true;
+    const auto module = BuildSdrModule();
+    REQUIRE(module->create("dual", config, {}) == Result::ERROR);
+    const auto calls = TestScript().calls();
+    REQUIRE(std::find(calls.begin(), calls.end(), "gain2:30") != calls.end());
+    REQUIRE(std::find(calls.begin(), calls.end(), "biastee:false") != calls.end());
+    REQUIRE(calls.back() == "close");
+    REQUIRE(module->state() == Module::State::DESTROYED);
+}
+
+TEST_CASE_METHOD(ScriptedDrivers,
+                 "Dual RX device disconnection stops both outputs",
+                 "[modules][sdr][dual-rx][lifecycle]") {
+    TestScript().receiveChannels = 2;
+    TestScript().budget = 0;
+    auto config = ScriptedConfig();
+    config.dualRx = true;
+    const auto module = BuildSdrModule();
+    const ModuleCleanup cleanup{module};
+    REQUIRE(module->create("dual", config, {}) == Result::SUCCESS);
+    {
+        std::lock_guard lock(TestScript().mutex);
+        TestScript().nextRead = Radio::Device::Capture{
+            .status = Radio::Device::Status::Disconnected, .error = "unplugged"};
+    }
+    const auto runtime = RuntimeOf(module);
+    REQUIRE(WaitFor([&] { return runtime->computeSubmit() == Result::ERROR; }));
+    REQUIRE(module->outputs().contains("signal"));
+    REQUIRE(module->outputs().contains("signal2"));
+}

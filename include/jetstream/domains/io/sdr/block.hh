@@ -8,6 +8,9 @@ namespace Jetstream::Blocks {
 struct Sdr : public Block::Config {
     std::string deviceString = "";
     std::string antenna = "";
+    bool dualRx = false;
+    bool automaticGain2 = true;
+    F32 manualGain2 = 30.0f;
     F32 frequency = 96.9e6;
     F32 frequencyStep = 1000000.0;
     F32 sampleRate = 2.0e6;
@@ -21,9 +24,9 @@ struct Sdr : public Block::Config {
     JST_BLOCK_TYPE(sdr);
     JST_BLOCK_DOMAIN("IO");
     JST_BLOCK_NODE_SIZE(M);
-    JST_BLOCK_PARAMS(deviceString, antenna, frequency, frequencyStep,
-                     sampleRate, automaticGain, manualGain, biasTee, numberOfBatches,
-                     numberOfTimeSamples, bufferMultiplier);
+    JST_BLOCK_PARAMS(deviceString, antenna, dualRx, automaticGain2, manualGain2,
+                     frequency, frequencyStep, sampleRate, automaticGain, manualGain,
+                     biasTee, numberOfBatches, numberOfTimeSamples, bufferMultiplier);
     JST_BLOCK_DESCRIPTION(
         "SDR",
         "Receives samples from a USB radio.",
@@ -32,6 +35,14 @@ struct Sdr : public Block::Config {
         "Streams complex samples from a radio plugged in over USB, using drivers built "
         "into CyberEther. It usually starts a chain, feeding a Spectrum Analyzer to "
         "watch the band or a Filter that isolates one station.\n"
+        "\n"
+        "**Dual-channel reception:** On bladeRF 2.0, enable Dual RX to receive both "
+        "antenna ports in one block. RX1 and RX2 produce aligned buffers at the same "
+        "frequency and sample rate. Connect each output to its own processing chain. "
+        "Each channel "
+        "has separate automatic and manual gain controls; Bias-T is shared. "
+        "Dual RX requires FPGA v0.15.3 or newer for correct timestamps. "
+        "The original bladeRF supports only one receiver.\n"
         "\n"
         "- **The radio paces the chain.** Each buffer comes out only once the radio has"
         " delivered all of its samples.\n"
@@ -48,6 +59,13 @@ struct Sdr : public Block::Config {
         "`sampleAxis`. Sets `frequency` and `sampleRate` to the values the radio "
         "applied to these samples. |\n"
         "\n"
+        "In Dual RX mode, **Output** is labeled **RX1**, and **RX2** is an additional "
+        "CF32 output with the same shape and signal axes. Both outputs advance and "
+        "discard samples together, including when either processing chain falls "
+        "behind. "
+        "Mode changes restart reception. Disabling Dual RX leaves RX2 consumers "
+        "waiting for their source until it is enabled again.\n"
+        "\n"
         "## Settings\n"
         "\n"
         "| Setting | Default | Range | Effect |\n"
@@ -57,6 +75,10 @@ struct Sdr : public Block::Config {
         "device. |\n"
         "| **Antenna** | Default | Default and the radio's receive ports | Receive "
         "port. Only LimeSDR lists ports. |\n"
+        "| **Dual RX** | Off | On, Off on bladeRF 2.0 | Enables aligned RX1 and RX2 "
+        "outputs. Frequency, sample rate, and buffer dimensions apply to both. |\n"
+        "| **RX2 Automatic / Manual Gain** | On / 30 dB | Channel gain range | "
+        "Independent RX2 gain controls, shown in Dual RX mode. |\n"
         "| **Frequency** | 96.9 MHz | Within the radio's range | Center frequency of "
         "the output. |\n"
         "| **Sample Rate** | 2 MHz | Within the radio's range | Complex samples per "
@@ -86,7 +108,9 @@ struct Sdr : public Block::Config {
         "| **Buffer Loss** | Share of samples overwritten before the chain read them "
         "since the stream started. Gaps the radio reported show next to it as GAP. |\n"
         "| **Throughput** | Rate the chain reads in MB/s, next to the rate the radio "
-        "sends at 8 bytes per sample. |\n"
+        "sends at 8 bytes per sample per channel; Dual RX reports both channels "
+        "combined. "
+        "|\n"
         "\n"
         "## Recipes\n"
         "\n"
@@ -135,7 +159,11 @@ struct Sdr : public Block::Config {
         "## Under the Hood\n"
         "\n"
         "A receive thread reads the radio into a ring buffer, and each cycle copies out"
-        " one full buffer. Frequency, Automatic Gain, and Manual Gain changes apply "
+        " one full buffer (an aligned pair in Dual RX mode). Dual RX uses roughly "
+        "twice the USB bandwidth and sample memory at the same sample rate. "
+        "Dual-channel reception preserves sample alignment; antenna phase and "
+        "gain calibration are separate. "
+        "Frequency, Automatic Gain, and Manual Gain changes apply "
         "while the stream keeps running. A sample rate change reapplies the whole "
         "configuration.\n"
         "\n"

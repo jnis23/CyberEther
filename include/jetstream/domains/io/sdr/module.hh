@@ -9,6 +9,9 @@ namespace Jetstream::Modules {
 struct Sdr : public Module::Config {
     std::string deviceString = "";
     std::string antenna = "";
+    bool dualRx = false;
+    bool automaticGain2 = true;
+    F32 manualGain2 = 30.0f;
     F32 frequency = 96.9e6;
     F32 sampleRate = 2.0e6;
     bool automaticGain = true;
@@ -19,9 +22,9 @@ struct Sdr : public Module::Config {
     U64 bufferMultiplier = 4;
 
     JST_MODULE_TYPE(sdr);
-    JST_MODULE_PARAMS(deviceString, antenna, frequency, sampleRate,
-                      automaticGain, manualGain, biasTee, numberOfBatches,
-                      numberOfTimeSamples, bufferMultiplier);
+    JST_MODULE_PARAMS(deviceString, antenna, dualRx, automaticGain2, manualGain2,
+                      frequency, sampleRate, automaticGain, manualGain, biasTee,
+                      numberOfBatches, numberOfTimeSamples, bufferMultiplier);
 };
 
 }  // namespace Jetstream::Modules

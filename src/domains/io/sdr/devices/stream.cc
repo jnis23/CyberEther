@@ -44,12 +44,37 @@ U64 Stream::guard() const {
     return GuardSamples(seconds, appliedSettings.sampleRate);
 }
 
+Device::Capture Stream::readChannels(std::span<std::span<CF32>> samples,
+                                    const std::chrono::milliseconds timeout) {
+    if (samples.size() != 1) {
+        return {.status = Device::Status::Failure,
+                .error = "this radio supports only single-channel reads"};
+    }
+    return read(samples.front(), timeout);
+}
+
+Result Stream::setSecondGain(bool, F64) {
+    JST_ERROR("[SDR] {} does not support independent RX2 gain control.",
+              deviceInfo.label);
+    return Result::ERROR;
+}
+
 Result Stream::start(const Settings& settings) {
     JST_CHECK(configure(settings));
-    return open();
+    const auto result = open();
+    if (result != Result::SUCCESS) {
+        close();
+    }
+    return result;
 }
 
 Result Stream::configure(const Settings& settings) {
+    if (settings.receiveChannels == 0 ||
+        settings.receiveChannels > deviceCapabilities.receiveChannels) {
+        JST_ERROR("[SDR] {} does not support {} receive channels.",
+                  deviceInfo.label, settings.receiveChannels);
+        return Result::ERROR;
+    }
     close();
     JST_CHECK(apply(settings));
     if (guard() == std::numeric_limits<U64>::max()) {
@@ -72,8 +97,9 @@ Result Stream::setSettlingTime(const F64 settlingTime) {
 
 Result Stream::update(const Settings& settings) {
     const auto previous = requestedSettings;
-    if (settings.sampleRate != previous.sampleRate || settings.antenna != previous.antenna ||
-        settings.biasTee != previous.biasTee) {
+    if (settings.receiveChannels != previous.receiveChannels ||
+        settings.sampleRate != previous.sampleRate ||
+        settings.antenna != previous.antenna || settings.biasTee != previous.biasTee) {
         return restart(settings, previous);
     }
 
@@ -93,6 +119,13 @@ Result Stream::update(const Settings& settings) {
         if (target.gain != previous.gain ||
             resolveGain(target.gain, appliedSettings.gainRange) != appliedSettings.gain) {
             JST_CHECK(setGain(target.gain));
+        }
+        if (target.receiveChannels == 2 &&
+            (target.automaticGain2 != previous.automaticGain2 ||
+             target.gain2 != previous.gain2 ||
+             resolveGain(target.gain2, appliedSettings.gainRange2) !=
+                 appliedSettings.gain2)) {
+            JST_CHECK(setSecondGain(target.automaticGain2, target.gain2));
         }
         if (target.settlingTime != previous.settlingTime) {
             JST_CHECK(setSettlingTime(target.settlingTime));
