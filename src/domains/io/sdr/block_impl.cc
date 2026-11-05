@@ -22,7 +22,7 @@ struct SdrImpl : public Block::Impl, public DynamicConfig<Blocks::Sdr> {
 
  private:
     const Modules::SdrImpl* createdModule(const Blocks::Sdr& config);
-    Parser::Map manualGainFormat(const Blocks::Sdr& config, bool second = false);
+    Parser::Map manualGainFormat(const Blocks::Sdr& config);
     Parser::Map antennaFormat(const Blocks::Sdr& config);
     Parser::Map sampleRateFormat(const Blocks::Sdr& config);
 };
@@ -41,9 +41,9 @@ Result SdrImpl::validate() {
 Result SdrImpl::configure() {
     moduleConfig->deviceString = deviceString;
     moduleConfig->antenna = antenna;
-    moduleConfig->dualRx = dualRx;
-    moduleConfig->automaticGain2 = automaticGain2;
-    moduleConfig->manualGain2 = manualGain2;
+    moduleConfig->channels = channels;
+    moduleConfig->automaticGains = automaticGains;
+    moduleConfig->manualGains = manualGains;
     moduleConfig->frequency = frequency;
     moduleConfig->sampleRate = sampleRate;
     moduleConfig->automaticGain = automaticGain;
@@ -58,15 +58,13 @@ Result SdrImpl::configure() {
 
 Result SdrImpl::define() {
     const auto& config = *candidate();
+    const bool gainOverrides = config.channels > 1 ||
+        !config.automaticGains.empty() || !config.manualGains.empty();
 
-    JST_CHECK(defineInterfaceOutput("signal",
-                                    config.dualRx ? "RX1" : "Output",
-                                    "The output buffer containing samples from the radio."));
-
-    if (config.dualRx) {
-        JST_CHECK(defineInterfaceOutput("signal2", "RX2",
-                                        "Samples from RX2, aligned with RX1."));
-    }
+    JST_CHECK(
+        defineInterfaceOutput("signal", "Output",
+                              "Samples with channel, batch, and sample axes; "
+                              "single-channel output has batch and sample axes."));
 
     Parser::Sequence deviceOptions{Parser::Map{{"label", "None"}, {"value", ""}}};
     bool selectionListed = config.deviceString.empty();
@@ -85,16 +83,12 @@ Result SdrImpl::define() {
                                     "Select a radio to receive samples. Choose None to disconnect.",
                                     {{"type", "dropdown"}, {"options", std::move(deviceOptions)}}));
 
-    const auto caps = Radio::Device::Cached(config.deviceString);
-    if (config.dualRx || (caps && caps->receiveChannels > 1)) {
-        JST_CHECK(defineInterfaceConfig(
-            "dualRx", "Dual RX",
-            "Receive from RX1 and RX2 simultaneously, with shared frequency and "
-            "sample rate and independent gain controls. "
-            "Changes restart reception.",
-            {{"type", "bool"}}));
-    }
-    if (!config.dualRx) {
+    JST_CHECK(defineInterfaceConfig(
+        "channels", "Channels",
+        "Number of synchronized receive channels. More than one adds an outer "
+        "channel dimension to Output. Changes restart reception.",
+        {{"type", "uint"}, {"unit", "channels"}}));
+    if (config.channels == 1) {
         JST_CHECK(defineInterfaceConfig(
             "antenna", "Antenna", "Receive antenna port. Changes restart the receiver.",
             antennaFormat(config)));
@@ -114,27 +108,31 @@ Result SdrImpl::define() {
                                     sampleRateFormat(config)));
 
     JST_CHECK(defineInterfaceConfig(
-        "automaticGain", config.dualRx ? "RX1 Automatic Gain" : "Automatic Gain",
-        "Enable automatic gain control on radios that support it.",
+        "automaticGain",
+        gainOverrides ? "Default Automatic Gain" : "Automatic Gain",
+        "Automatic gain used by channels without an Automatic Gains override.",
         {{"type", "bool"}}));
 
-    if (!config.automaticGain) {
+    if (!config.automaticGain || gainOverrides) {
         JST_CHECK(defineInterfaceConfig(
-            "manualGain", config.dualRx ? "RX1 Manual Gain" : "Manual Gain",
-            "Receive gain applied while automatic gain is off.",
+            "manualGain", gainOverrides ? "Default Manual Gain" : "Manual Gain",
+            "Manual gain used by channels without a Manual Gains override.",
             manualGainFormat(config)));
     }
-
-    if (config.dualRx) {
-        JST_CHECK(defineInterfaceConfig("automaticGain2", "RX2 Automatic Gain",
-                                        "Enable automatic gain control on RX2.",
-                                        {{"type", "bool"}}));
-        if (!config.automaticGain2) {
-            JST_CHECK(defineInterfaceConfig(
-                "manualGain2", "RX2 Manual Gain",
-                "Receive gain applied to RX2 while automatic gain is off.",
-                manualGainFormat(config, true)));
-        }
+    if (gainOverrides) {
+        JST_CHECK(defineInterfaceConfig(
+            "automaticGains", "Automatic Gains",
+            "Values in RX order: 1 for automatic gain, 0 for manual. Missing entries "
+            "use Default Automatic Gain. Lists resize when Channels changes.",
+            {{"type", "vector-inline"}, {"value_type", "uint"}}));
+        const auto caps = Radio::Device::Cached(config.deviceString);
+        JST_CHECK(defineInterfaceConfig(
+            "manualGains", "Manual Gains",
+            "Gains in RX order, clamped to each receiver range. Missing entries use "
+            "Default Manual Gain. Lists resize when Channels changes.",
+            {{"type", "vector-inline"},
+             {"value_type", "float"},
+             {"unit", caps ? caps->gainUnit : "dB"}}));
     }
 
     if (Radio::Device::SupportsBiasTee(config.deviceString)) {
@@ -201,34 +199,18 @@ Result SdrImpl::define() {
 }
 
 Result SdrImpl::create() {
-    const auto cached = Radio::Device::Cached(deviceString);
-    const bool dualRxDefined = dualRx || (cached && cached->receiveChannels > 1);
     const auto result = moduleCreate("sdr", moduleConfig, {});
     JST_CHECK(updateInterfaceConfigFormat("sampleRate", sampleRateFormat(*this)));
     JST_CHECK(result);
     JST_CHECK(moduleExposeOutput("signal", {"sdr", "signal"}));
-    if (dualRx) {
-        JST_CHECK(moduleExposeOutput("signal2", {"sdr", "signal2"}));
-    }
 
     moduleImpl = moduleHandle("sdr")->getImpl<Modules::SdrImpl>();
     sampleRate = moduleImpl->sampleRate;
     moduleConfig->sampleRate = sampleRate;
-    if (!dualRx) {
+    if (channels == 1) {
         JST_CHECK(updateInterfaceConfigFormat("antenna", antennaFormat(*this)));
     }
 
-    if (!dualRxDefined) {
-        if (const auto caps = Radio::Device::Cached(deviceString);
-            caps && caps->receiveChannels > 1) {
-            JST_CHECK(defineInterfaceConfig(
-                "dualRx", "Dual RX",
-                "Receive from RX1 and RX2 simultaneously, with shared frequency and "
-                "sample rate and independent gain controls. "
-                "Changes restart reception.",
-                {{"type", "bool"}}));
-        }
-    }
     return reconfigure();
 }
 
@@ -238,17 +220,14 @@ Result SdrImpl::reconfigure() {
         moduleConfig->manualGain = manualGain;
     }
 
-    if (dualRx) {
-        if (const auto* sdr = createdModule(*this); sdr && sdr->getGainRange(true)) {
-            manualGain2 = sdr->manualGain2;
-            moduleConfig->manualGain2 = manualGain2;
-        }
-        if (!automaticGain2) {
-            JST_CHECK(updateInterfaceConfigFormat("manualGain2",
-                                                  manualGainFormat(*this, true)));
-        }
+    if (const auto* sdr = createdModule(*this)) {
+        automaticGains = sdr->automaticGains;
+        manualGains = sdr->manualGains;
+        moduleConfig->automaticGains = automaticGains;
+        moduleConfig->manualGains = manualGains;
     }
-    if (!automaticGain) {
+    if (!automaticGain || channels > 1 ||
+        !automaticGains.empty() || !manualGains.empty()) {
         JST_CHECK(updateInterfaceConfigFormat("manualGain", manualGainFormat(*this)));
     }
 
@@ -264,9 +243,9 @@ const Modules::SdrImpl* SdrImpl::createdModule(const Blocks::Sdr& config) {
     return sdr && sdr->deviceString == config.deviceString ? sdr : nullptr;
 }
 
-Parser::Map SdrImpl::manualGainFormat(const Blocks::Sdr& config, const bool second) {
+Parser::Map SdrImpl::manualGainFormat(const Blocks::Sdr& config) {
     const auto* sdr = createdModule(config);
-    const auto range = sdr ? sdr->getGainRange(second) : std::nullopt;
+    const auto range = sdr ? sdr->getGainRange() : std::nullopt;
     const F32 minimum = range ? static_cast<F32>(range->minimum) : 0.0f;
     const F32 maximum = range ? static_cast<F32>(range->maximum) : 60.0f;
     const auto capabilities = Radio::Device::Cached(config.deviceString);

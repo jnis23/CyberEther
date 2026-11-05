@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "device.hh"
 
@@ -14,6 +15,17 @@ namespace Jetstream::Radio {
 
 class JETSTREAM_API Stream {
  public:
+  struct GainSettings {
+      bool automatic = true;
+      F64 gain = 30.0;
+  };
+
+  struct GainApplied {
+      bool automatic = false;
+      F64 gain = 0.0;
+      std::optional<Device::Range> range;
+  };
+
     struct Settings {
         F64 frequency = 96.9e6;
         F64 sampleRate = 2.0e6;
@@ -23,8 +35,8 @@ class JETSTREAM_API Stream {
         F64 settlingTime = -1.0;
         F64 gain = 30.0;
         U64 receiveChannels = 1;
-        bool automaticGain2 = true;
-        F64 gain2 = 30.0;
+        // Additional receivers, starting at RX2. RX1 retains the single-RX API.
+        std::vector<GainSettings> additionalGains;
     };
 
     struct Applied {
@@ -35,9 +47,7 @@ class JETSTREAM_API Stream {
         bool biasTee = false;
         F64 gain = 0.0;
         std::optional<Device::Range> gainRange;
-        bool automaticGain2 = false;
-        F64 gain2 = 0.0;
-        std::optional<Device::Range> gainRange2;
+        std::vector<GainApplied> additionalGains;
     };
 
     virtual ~Stream() = default;
@@ -67,7 +77,7 @@ class JETSTREAM_API Stream {
     virtual Result setAutomaticGain(bool automaticGain) = 0;
     virtual Result setGain(F64 gain) = 0;
 
-    virtual Result setSecondGain(bool automaticGain, F64 gain);
+    virtual Result setChannelGain(U64 channel, bool automaticGain, F64 gain);
 
     U64 guard() const;
     U64 nextGeneration();

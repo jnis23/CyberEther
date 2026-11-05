@@ -36,11 +36,11 @@ struct JETSTREAM_API SdrImpl : public Module::Impl, public DynamicConfig<Sdr> {
     std::pair<F32, F32> getThroughput() const;
     std::vector<std::string> listAntennas() const;
     Radio::Stream::Applied getApplied() const;
-    std::optional<Radio::Device::Range> getGainRange(bool second = false) const;
+    std::optional<Radio::Device::Range> getGainRange(U64 channel = 0) const;
 
- protected:
+   protected:
     Tensor buffer;
-    Tensor buffer2;
+    std::vector<CF32*> outputChannels;
 
     U64 validatedOutputSizeBytes = 0;
     U64 validatedInternalElements = 0;

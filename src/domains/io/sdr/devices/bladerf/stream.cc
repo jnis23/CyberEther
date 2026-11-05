@@ -96,9 +96,9 @@ class BladeRfStream final : public Stream {
     Result tune(F64 frequency) override;
     Result setAutomaticGain(bool automaticGain) override;
     Result setGain(F64 gain) override;
-    Result setSecondGain(bool automaticGain, F64 gain) override;
+    Result setChannelGain(U64 channel, bool automaticGain, F64 gain) override;
 
- private:
+   private:
     Result setFrequency(F64 frequency);
     Result resynchronize(U64 settle);
     Result applyGainMode(bool requested, F64 gain, U64 index = 0);
@@ -165,21 +165,25 @@ Result BladeRfStream::connect(const Device::Info& info) {
 }
 
 Result BladeRfStream::apply(const Settings& settings) {
+    if (settings.receiveChannels > 2) {
+        JST_ERROR("[SDR_BLADERF] This backend supports at most two RX channels.");
+        return Result::ERROR;
+    }
     if (settings.receiveChannels == 2) {
         struct bladerf_version version = {};
         if (bladerf_fpga_version(handle, &version) != 0) {
-            JST_ERROR("[SDR_BLADERF] Failed to query the FPGA version for dual RX.");
+            JST_ERROR(
+                "[SDR_BLADERF] Failed to query the FPGA version for multi-channel RX.");
             return Result::ERROR;
         }
-        // Earlier images advance the Dual RX timestamp by 255 for 254 sample pairs,
+        // Earlier images advance the RX timestamp by 255 for 254 sample pairs,
         // breaking capture continuity (Nuand/bladeRF issue #855).
         if (std::tuple{version.major, version.minor, version.patch} <
             std::tuple{0, 15, 3}) {
             JST_ERROR(
-                "[SDR_BLADERF] Dual RX requires FPGA v0.15.3 or newer for correct "
-                "dual-channel timestamps; the device has v{}.{}.{}. Load a compatible "
-                "FPGA "
-                "image before enabling Dual RX.",
+                "[SDR_BLADERF] Multiple RX channels require FPGA v0.15.3 or newer "
+                "for correct timestamps; the device has v{}.{}.{}. Load a compatible "
+                "FPGA image before enabling multiple channels.",
                 version.major, version.minor, version.patch);
             return Result::ERROR;
         }
@@ -213,9 +217,11 @@ Result BladeRfStream::apply(const Settings& settings) {
         return Result::ERROR;
     }
 
+    appliedSettings.additionalGains.resize(settings.receiveChannels - 1);
     JST_CHECK(applyGainMode(settings.automaticGain, settings.gain));
-    if (settings.receiveChannels == 2) {
-        JST_CHECK(applyGainMode(settings.automaticGain2, settings.gain2, 1));
+    for (U64 i = 0; i < settings.additionalGains.size(); ++i) {
+        const auto& gain = settings.additionalGains[i];
+        JST_CHECK(applyGainMode(gain.automatic, gain.gain, i + 1));
     }
 
     if (deviceCapabilities.biasTee && (settings.biasTee || biasTeeEnabled)) {
@@ -286,8 +292,9 @@ Result BladeRfStream::setFrequency(const F64 frequency) {
     requestedSettings.frequency = frequency;
     appliedSettings.frequency = static_cast<F64>(actual);
     JST_CHECK(applyGain(requestedSettings.gain, changedBand));
-    if (requestedSettings.receiveChannels == 2) {
-        JST_CHECK(applyGain(requestedSettings.gain2, changedBand, 1));
+    for (U64 i = 0; i < requestedSettings.additionalGains.size(); ++i) {
+        JST_CHECK(
+            applyGain(requestedSettings.additionalGains[i].gain, changedBand, i + 1));
     }
     return Result::SUCCESS;
 }
@@ -437,10 +444,10 @@ Result BladeRfStream::setGain(const F64 gain) {
     return Result::SUCCESS;
 }
 
-Result BladeRfStream::setSecondGain(const bool automaticGain, const F64 gain) {
-    JST_CHECK(applyGainMode(automaticGain, gain, 1));
-    requestedSettings.automaticGain2 = automaticGain;
-    requestedSettings.gain2 = gain;
+Result BladeRfStream::setChannelGain(const U64 channel, const bool automaticGain,
+                                     const F64 gain) {
+    JST_CHECK(applyGainMode(automaticGain, gain, channel));
+    requestedSettings.additionalGains[channel - 1] = {automaticGain, gain};
     return Result::SUCCESS;
 }
 
@@ -460,17 +467,19 @@ Result BladeRfStream::applyGainMode(const bool requested, const F64 gain,
         JST_ERROR("[SDR_BLADERF] Failed to set the gain mode.");
         return Result::ERROR;
     }
-    (index == 0 ? appliedSettings.automaticGain : appliedSettings.automaticGain2) =
-        automatic;
+    (index == 0 ? appliedSettings.automaticGain
+                : appliedSettings.additionalGains[index - 1].automatic) = automatic;
     return applyGain(gain, true, index);
 }
 
 Result BladeRfStream::applyGain(const F64 gain, const bool force, const U64 index) {
-    auto& gainRange =
-        index == 0 ? appliedSettings.gainRange : appliedSettings.gainRange2;
-    auto& appliedGain = index == 0 ? appliedSettings.gain : appliedSettings.gain2;
-    const bool automatic =
-        index == 0 ? appliedSettings.automaticGain : appliedSettings.automaticGain2;
+    auto& gainRange = index == 0 ? appliedSettings.gainRange
+                                 : appliedSettings.additionalGains[index - 1].range;
+    auto& appliedGain = index == 0 ? appliedSettings.gain
+                                   : appliedSettings.additionalGains[index - 1].gain;
+    const bool automatic = index == 0
+                               ? appliedSettings.automaticGain
+                               : appliedSettings.additionalGains[index - 1].automatic;
     const bladerf_range* range = nullptr;
     if (bladerf_get_gain_range(handle, BLADERF_CHANNEL_RX(index), &range) != 0 ||
         !range) {

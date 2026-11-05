@@ -1,7 +1,6 @@
 #include "module_impl.hh"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <new>
 
@@ -36,8 +35,16 @@ Result SdrImpl::validate() {
         JST_ERROR("[MODULE_SDR] Sample rate must be finite and positive.");
         return Result::ERROR;
     }
-    if (!std::isfinite(config.manualGain) || !std::isfinite(config.manualGain2)) {
+    if (!std::isfinite(config.manualGain) ||
+        std::ranges::any_of(config.manualGains,
+                            [](F32 gain) { return !std::isfinite(gain); })) {
         JST_ERROR("[MODULE_SDR] Manual gain must be finite.");
+        return Result::ERROR;
+    }
+    if (config.channels == 0 ||
+        std::ranges::any_of(config.automaticGains, [](U64 mode) { return mode > 1; })) {
+        JST_ERROR("[MODULE_SDR] Channels must be positive; automatic gain entries "
+                  "must be 0 (manual) or 1 (automatic).");
         return Result::ERROR;
     }
     if (config.numberOfBatches == 0) {
@@ -72,10 +79,10 @@ Result SdrImpl::validate() {
         return Result::ERROR;
     }
 
-    if (config.dualRx &&
-        (!detail::CheckedMultiply(outputSizeBytes, U64{2}, outputSizeBytes) ||
-         !detail::CheckedMultiply(internalSizeBytes, U64{2}, internalSizeBytes))) {
-        JST_ERROR("[MODULE_SDR] Dual RX buffers are too large.");
+    if (!detail::CheckedMultiply(outputSizeBytes, config.channels, outputSizeBytes) ||
+        !detail::CheckedMultiply(internalSizeBytes, config.channels,
+                                 internalSizeBytes)) {
+        JST_ERROR("[MODULE_SDR] Multi-channel buffers are too large.");
         return Result::ERROR;
     }
     validatedOutputSizeBytes = outputSizeBytes;
@@ -86,9 +93,6 @@ Result SdrImpl::validate() {
 
 Result SdrImpl::define() {
     JST_CHECK(defineInterfaceOutput("signal"));
-    if (candidate()->dualRx) {
-        JST_CHECK(defineInterfaceOutput("signal2"));
-    }
     return Result::SUCCESS;
 }
 
@@ -108,8 +112,10 @@ Result SdrImpl::create() {
     JST_CHECK(Radio::Stream::Open(deviceString, radio));
     const auto& caps = radio->capabilities();
     antennas = caps.antennas;
-    if (dualRx && caps.receiveChannels < 2) {
-        JST_ERROR("[MODULE_SDR] Selected radio does not support Dual RX.");
+    if (channels > caps.receiveChannels) {
+        JST_ERROR(
+            "[MODULE_SDR] Selected radio supports {} receive channels; requested {}.",
+            caps.receiveChannels, channels);
         radio.reset();
         return Result::ERROR;
     }
@@ -122,18 +128,30 @@ Result SdrImpl::create() {
     }
 
     try {
-        JST_CHECK(buffer.create(device(), DataType::CF32,
-                                {numberOfBatches, numberOfTimeSamples}));
-        JST_CHECK(SetSignalAxes(buffer, {
-            .sample = Index{1},
-            .batch = Index{0},
-        }));
-        if (dualRx) {
-            JST_CHECK(buffer2.create(device(), DataType::CF32,
-                                     {numberOfBatches, numberOfTimeSamples}));
-            JST_CHECK(SetSignalAxes(buffer2, {.sample = Index{1}, .batch = Index{0}}));
+        if (!automaticGains.empty()) {
+            automaticGains.resize(channels, automaticGain ? 1 : 0);
         }
-        JST_CHECK(stream.resize(validatedInternalElements, dualRx ? 2 : 1));
+        if (!manualGains.empty()) {
+            manualGains.resize(channels, manualGain);
+        }
+        Shape shape{numberOfBatches, numberOfTimeSamples};
+        if (channels > 1) {
+            shape.insert(shape.begin(), channels);
+        }
+        JST_CHECK(buffer.create(device(), DataType::CF32, shape));
+        JST_CHECK(SetSignalAxes(
+            buffer,
+            {
+                .sample = Index{shape.size() - 1},
+                .batch = Index{shape.size() - 2},
+                .channel = channels > 1 ? std::optional<Index>{0} : std::nullopt,
+            }));
+        outputChannels.resize(channels);
+        const U64 channelElements = numberOfBatches * numberOfTimeSamples;
+        for (U64 i = 0; i < channels; ++i) {
+            outputChannels[i] = buffer.data<CF32>() + i * channelElements;
+        }
+        JST_CHECK(stream.resize(validatedInternalElements, channels));
     } catch (const std::bad_alloc&) {
         JST_ERROR("[MODULE_SDR] Failed to allocate the internal buffer.");
         radio.reset();
@@ -145,17 +163,18 @@ Result SdrImpl::create() {
         return result;
     }
     resetStream();
-    if (radio->applied().gainRange) {
+    if (channels == 1 && manualGains.empty() && radio->applied().gainRange) {
         manualGain = static_cast<F32>(radio->applied().gain);
     }
 
-    if (dualRx && radio->applied().gainRange2) {
-        manualGain2 = static_cast<F32>(radio->applied().gain2);
+    if (!manualGains.empty()) {
+        manualGains[0] = static_cast<F32>(radio->applied().gain);
+        for (U64 i = 1; i < channels; ++i) {
+            manualGains[i] =
+                static_cast<F32>(radio->applied().additionalGains[i - 1].gain);
+        }
     }
     outputs()["signal"].produced(name(), "signal", buffer);
-    if (dualRx) {
-        outputs()["signal2"].produced(name(), "signal2", buffer2);
-    }
     publishedMetadata = {};
     JST_CHECK(publishMetadata(stream.metadata()));
 
@@ -177,10 +196,8 @@ Result SdrImpl::destroy() {
 Result SdrImpl::reconfigure() {
     const auto& config = *candidate();
 
-    if (config.dualRx != dualRx ||
-        config.deviceString != deviceString ||
-        config.antenna != antenna ||
-        config.biasTee != biasTee ||
+    if (config.channels != channels || config.deviceString != deviceString ||
+        config.antenna != antenna || config.biasTee != biasTee ||
         config.numberOfBatches != numberOfBatches ||
         config.numberOfTimeSamples != numberOfTimeSamples ||
         config.bufferMultiplier != bufferMultiplier) {
@@ -221,26 +238,46 @@ Result SdrImpl::reconfigure() {
         frequency = config.frequency;
         sampleRate = config.sampleRate;
         automaticGain = config.automaticGain;
-        automaticGain2 = config.automaticGain2;
-        manualGain2 =
-            applied.gainRange2 ? static_cast<F32>(applied.gain2) : config.manualGain2;
-        manualGain = applied.gainRange ? static_cast<F32>(applied.gain) : config.manualGain;
+        automaticGains = config.automaticGains;
+        if (!automaticGains.empty()) {
+            automaticGains.resize(channels, config.automaticGain ? 1 : 0);
+        }
+        manualGains = config.manualGains;
+        if (!manualGains.empty()) {
+            manualGains.resize(channels, config.manualGain);
+            manualGains[0] = static_cast<F32>(applied.gain);
+            for (U64 i = 1; i < channels; ++i) {
+                manualGains[i] = static_cast<F32>(applied.additionalGains[i - 1].gain);
+            }
+        }
+        manualGain = channels == 1 && manualGains.empty() && applied.gainRange
+                         ? static_cast<F32>(applied.gain)
+                         : config.manualGain;
         return Result::SUCCESS;
     });
 }
 
 Radio::Stream::Settings SdrImpl::settingsOf(const Sdr& config) const {
-    return {
+    Radio::Stream::Settings settings{
         .frequency = config.frequency,
         .sampleRate = config.sampleRate,
-        .antenna = config.dualRx ? std::string{} : config.antenna,
-        .automaticGain = config.automaticGain,
+        .antenna = config.channels > 1 ? std::string{} : config.antenna,
+        .automaticGain = config.automaticGains.empty() ? config.automaticGain
+                                                       : config.automaticGains[0] != 0,
         .biasTee = config.biasTee,
-        .gain = config.manualGain,
-        .receiveChannels = config.dualRx ? U64{2} : U64{1},
-        .automaticGain2 = config.automaticGain2,
-        .gain2 = config.manualGain2,
+        .gain = config.manualGains.empty() ? config.manualGain : config.manualGains[0],
+        .receiveChannels = config.channels,
     };
+    for (U64 i = 1; i < config.channels; ++i) {
+        settings.additionalGains.push_back({
+            .automatic = i >= config.automaticGains.size()
+                             ? config.automaticGain
+                             : config.automaticGains[i] != 0,
+            .gain = i >= config.manualGains.size() ? config.manualGain
+                                                   : config.manualGains[i],
+        });
+    }
+    return settings;
 }
 
 void SdrImpl::resetStream() {
@@ -259,12 +296,6 @@ Result SdrImpl::publishMetadata(const Radio::StreamBuffer::Metadata& metadata) {
     }
     JST_CHECK(buffer.setAttribute("frequency", static_cast<F32>(metadata.frequency)));
     JST_CHECK(buffer.setAttribute("sampleRate", static_cast<F32>(metadata.sampleRate)));
-    if (dualRx) {
-        JST_CHECK(
-            buffer2.setAttribute("frequency", static_cast<F32>(metadata.frequency)));
-        JST_CHECK(
-            buffer2.setAttribute("sampleRate", static_cast<F32>(metadata.sampleRate)));
-    }
     publishedMetadata = metadata;
     return Result::SUCCESS;
 }
@@ -272,8 +303,7 @@ Result SdrImpl::publishMetadata(const Radio::StreamBuffer::Metadata& metadata) {
 Result SdrImpl::emitFrame() {
     Radio::StreamBuffer::Metadata metadata;
     const auto result =
-        stream.pop(buffer.data<CF32>(), dualRx ? buffer2.data<CF32>() : nullptr,
-                   buffer.size(), metadata);
+        stream.pop(outputChannels, numberOfBatches * numberOfTimeSamples, metadata);
     if (result == Result::INCOMPLETE) {
         return Result::YIELD;
     }
@@ -312,9 +342,14 @@ void SdrImpl::stopReceiver() {
 }
 
 Result SdrImpl::receiveLoop() {
-    std::vector<CF32> scratch(std::min<U64>(ReadChunk, std::max<U64>(stream.capacity(), 1)));
-    std::vector<CF32> scratch2(dualRx ? scratch.size() : 0);
-    std::array<std::span<CF32>, 2> destinations{scratch, scratch2};
+    const U64 chunk = std::min<U64>(ReadChunk, std::max<U64>(stream.capacity(), 1));
+    std::vector<std::vector<CF32>> scratch(channels, std::vector<CF32>(chunk));
+    std::vector<std::span<CF32>> destinations;
+    std::vector<const CF32*> pointers;
+    for (auto& channel : scratch) {
+        destinations.emplace_back(channel);
+        pointers.push_back(channel.data());
+    }
     U64 gaps = 0;
     U64 lost = 0;
 
@@ -328,21 +363,19 @@ Result SdrImpl::receiveLoop() {
             return Result::ERROR;
         }
 
-        const auto capture = radio->readChannels(
-            std::span(destinations).first(dualRx ? 2 : 1), ReadTimeout);
+        const auto capture = radio->readChannels(destinations, ReadTimeout);
         if (!streaming) {
             break;
         }
 
         switch (capture.status) {
             case Radio::Device::Status::Samples: {
-                if (capture.count > scratch.size()) {
+                if (capture.count > chunk) {
                     JST_ERROR(
                         "[MODULE_SDR] Radio returned more samples than requested.");
                     return Result::ERROR;
                 }
-                stream.push(capture.generation, scratch.data(),
-                            dualRx ? scratch2.data() : nullptr, capture.count,
+                stream.push(capture.generation, pointers, capture.count,
                             capture.timestamp, capture.epoch);
                 Scheduler::Context::NotifyPendingCompute();
                 const U64 capacity = stream.capacity();
@@ -352,10 +385,10 @@ Result SdrImpl::receiveLoop() {
                 }
                 const auto current = stream.metadata();
                 throughput.publish({
-                    static_cast<F32>(stream.throughput() * sizeof(CF32) *
-                                     (dualRx ? 2 : 1) / 1e6),
-                    static_cast<F32>(current.sampleRate * sizeof(CF32) *
-                                     (dualRx ? 2 : 1) / 1e6),
+                    static_cast<F32>(stream.throughput() * sizeof(CF32) * channels /
+                                     1e6),
+                    static_cast<F32>(current.sampleRate * sizeof(CF32) * channels /
+                                     1e6),
                 });
                 break;
             }
@@ -403,9 +436,14 @@ Radio::Stream::Applied SdrImpl::getApplied() const {
     return published.get();
 }
 
-std::optional<Radio::Device::Range> SdrImpl::getGainRange(const bool second) const {
+std::optional<Radio::Device::Range> SdrImpl::getGainRange(const U64 channel) const {
     const auto applied = published.get();
-    return second ? applied.gainRange2 : applied.gainRange;
+    if (channel == 0) {
+        return applied.gainRange;
+    }
+    return channel <= applied.additionalGains.size()
+               ? applied.additionalGains[channel - 1].range
+               : std::nullopt;
 }
 
 }  // namespace Jetstream::Modules

@@ -520,20 +520,21 @@ void SweepRestarts(const Device::Info& info) {
     }
 }
 
-void DualRx(const Device::Info& info) {
+void MultiChannelRx(const Device::Info& info) {
     auto stream = OpenStream(info);
     if (stream->capabilities().receiveChannels < 2) {
-        jst::fmt::print("[SKIP] dual RX: device has one receive channel\n");
+        jst::fmt::print("[SKIP] multi-channel RX: device has one receive channel\n");
         return;
     }
     auto settings = Settings(stream->capabilities());
     settings.sampleRate = 2.0e6;
     settings.receiveChannels = 2;
+    settings.additionalGains.resize(1);
     settings.automaticGain = false;
-    settings.automaticGain2 = false;
+    settings.additionalGains[0].automatic = false;
     settings.gain = 15.0;
-    settings.gain2 = 25.0;
-    Success(stream->start(settings), "start dual RX");
+    settings.additionalGains[0].gain = 25.0;
+    Success(stream->start(settings), "start multi-channel RX");
     std::array<CF32, 16384> first;
     std::array<CF32, 16384> second;
     std::array<std::span<CF32>, 2> destinations{first, second};
@@ -555,24 +556,26 @@ void DualRx(const Device::Info& info) {
                 expected.reset();
                 continue;
             }
-            Require(capture.status == Device::Status::Samples, "dual RX read failed");
+            Require(capture.status == Device::Status::Samples,
+                    "multi-channel RX read failed");
             Require(capture.count > 0 && capture.count <= first.size(),
-                    "invalid dual RX count");
-            Require(capture.timestamp.has_value(), "dual RX timestamp missing");
+                    "invalid multi-channel RX count");
+            Require(capture.timestamp.has_value(),
+                    "multi-channel RX timestamp missing");
             Require(!expected || *expected == *capture.timestamp,
-                    "dual RX timestamp discontinuity");
+                    "multi-channel RX timestamp discontinuity");
             Require(capture.generation == stream->generation(),
-                    "stale dual RX generation");
+                    "stale multi-channel RX generation");
             Require(Near(capture.frequency, stream->applied().frequency),
-                    "stale dual RX frequency");
+                    "stale multi-channel RX frequency");
             Require(Near(capture.sampleRate, stream->applied().sampleRate),
-                    "stale dual RX rate");
+                    "stale multi-channel RX rate");
             const auto finite = [](const CF32 value) {
                 return std::isfinite(value.real()) && std::isfinite(value.imag());
             };
             Require(std::all_of(first.begin(), first.begin() + capture.count, finite) &&
                     std::all_of(second.begin(), second.begin() + capture.count, finite),
-                    "invalid dual RX IQ");
+                    "invalid multi-channel RX IQ");
             expected = *capture.timestamp + capture.count;
             count += capture.count;
         }
@@ -582,33 +585,36 @@ void DualRx(const Device::Info& info) {
             "  {}: {:.3f} / {:.3f} MS/s per channel, {} gaps, {} lost samples\n", stage,
             rate / 1e6, stream->applied().sampleRate / 1e6, gaps, lost);
         Require(count > 0 && Near(rate, stream->applied().sampleRate, RateTolerance),
-                "dual RX throughput is outside tolerance");
+                "multi-channel RX throughput is outside tolerance");
         Require(static_cast<F64>(lost) / count <= LostFraction,
-                "excessive dual RX sample loss");
+                "excessive multi-channel RX sample loss");
     };
-    receive("dual RX start");
+    receive("multi-channel RX start");
     const F64 firstGain = stream->applied().gain;
-    settings.gain2 = 30.0;
+    settings.additionalGains[0].gain = 30.0;
     Success(stream->update(settings), "change RX2 gain");
     Require(stream->applied().gain == firstGain, "RX2 gain change modified RX1");
-    Require(stream->applied().gain2 == stream->resolveGain(settings.gain2,
-                stream->applied().gainRange2), "RX2 gain readback mismatch");
+    Require(stream->applied().additionalGains[0].gain ==
+                stream->resolveGain(settings.additionalGains[0].gain,
+                                    stream->applied().additionalGains[0].range),
+            "RX2 gain readback mismatch");
     receive("independent RX2 manual gain");
-    settings.automaticGain2 = true;
+    settings.additionalGains[0].automatic = true;
     Success(stream->update(settings), "enable RX2 automatic gain");
-    Require(!stream->applied().automaticGain && stream->applied().automaticGain2,
+    Require(!stream->applied().automaticGain &&
+                stream->applied().additionalGains[0].automatic,
             "RX2 automatic gain modified RX1 gain mode");
     receive("independent RX2 automatic gain");
-    settings.automaticGain2 = false;
+    settings.additionalGains[0].automatic = false;
     Success(stream->update(settings), "restore RX2 manual gain");
     settings.frequency += 1.0e6;
-    Success(stream->update(settings), "retune dual RX");
-    receive("dual RX retune");
+    Success(stream->update(settings), "retune multi-channel RX");
+    receive("multi-channel RX retune");
     settings.sampleRate = 4.0e6;
-    Success(stream->update(settings), "change dual RX rate");
-    receive("dual RX sample-rate change");
-    Success(stream->start(settings), "restart dual RX");
-    receive("dual RX restart");
+    Success(stream->update(settings), "change multi-channel RX rate");
+    receive("multi-channel RX sample-rate change");
+    Success(stream->start(settings), "restart multi-channel RX");
+    receive("multi-channel RX restart");
     std::unique_ptr<Stream> competing;
     Require(Stream::Open(info.selector(), competing) != Result::SUCCESS,
             "second block acquired an active bladeRF");
@@ -719,8 +725,8 @@ int main() {
             results.run("firmware sweep and restart", [&] { Sweeps(info, Plan::Mode::Firmware); });
         }
         if (info.driver == "bladerf") {
-            results.run("dual RX controls, timestamps, restart and ownership",
-                        [&] { DualRx(info); });
+            results.run("multi-channel RX controls, timestamps, restart and ownership",
+                        [&] { MultiChannelRx(info); });
         }
         results.run("stream/sweep close and reopen", [&] { Recovery(info); });
     }

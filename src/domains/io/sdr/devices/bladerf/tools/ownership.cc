@@ -43,7 +43,7 @@ Result BladeRfOwnership::acquire(const std::string& requested) {
     if (!registry.devices.insert(acquired).second) {
         JST_ERROR(
             "[SDR_BLADERF] Device '{}' is already in use. "
-            "Use one SDR block with Dual RX enabled for dual-channel reception.",
+            "Use one SDR block with Channels set to 2 for both receivers.",
             requested);
         return Result::ERROR;
     }

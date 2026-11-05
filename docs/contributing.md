@@ -40,7 +40,15 @@ The library follows the [Google C++ Code Style Guide](https://google.github.io/s
 
 ### Return Values
 
-All functions should return a `Result` type. This is an enum with the following values:
+Fallible operations should return `Result`. The SDR interfaces retain these
+exceptions to match their single-channel APIs: sample conversions and infallible
+state updates return `void`; accessors and predicates return values directly;
+`StreamBuffer::push` returns whether samples were accepted; and `Stream::read` /
+`readChannels` return `Device::Capture`, which includes status and error details
+alongside the captured sample metadata. These conventions also apply to overrides
+and test implementations.
+
+`Result` is an enum with the following values:
 
 | Result | Description |
 |--------|-------------|

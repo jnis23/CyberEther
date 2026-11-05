@@ -53,9 +53,9 @@ Device::Capture Stream::readChannels(std::span<std::span<CF32>> samples,
     return read(samples.front(), timeout);
 }
 
-Result Stream::setSecondGain(bool, F64) {
-    JST_ERROR("[SDR] {} does not support independent RX2 gain control.",
-              deviceInfo.label);
+Result Stream::setChannelGain(const U64 channel, bool, F64) {
+    JST_ERROR("[SDR] {} does not support gain control on RX{}.", deviceInfo.label,
+              channel + 1);
     return Result::ERROR;
 }
 
@@ -75,8 +75,20 @@ Result Stream::configure(const Settings& settings) {
                   deviceInfo.label, settings.receiveChannels);
         return Result::ERROR;
     }
+    if (!settings.additionalGains.empty() &&
+        settings.additionalGains.size() != settings.receiveChannels - 1) {
+        JST_ERROR("[SDR] Gain settings must match the receive channel count.");
+        return Result::ERROR;
+    }
+    Settings normalized = settings;
+    normalized.additionalGains.resize(settings.receiveChannels - 1);
     close();
-    JST_CHECK(apply(settings));
+    JST_CHECK(apply(normalized));
+    if (appliedSettings.additionalGains.size() != normalized.additionalGains.size()) {
+        JST_ERROR("[SDR] {} did not apply all receive channel gains.",
+                  deviceInfo.label);
+        return Result::ERROR;
+    }
     if (guard() == std::numeric_limits<U64>::max()) {
         JST_ERROR("[SDR] Settling guard exceeds the sample count range.");
         return Result::ERROR;
@@ -103,6 +115,13 @@ Result Stream::update(const Settings& settings) {
         return restart(settings, previous);
     }
 
+    if (!settings.additionalGains.empty() &&
+        settings.additionalGains.size() != settings.receiveChannels - 1) {
+        JST_ERROR("[SDR] Gain settings must match the receive channel count.");
+        return Result::ERROR;
+    }
+    Settings normalized = settings;
+    normalized.additionalGains.resize(settings.receiveChannels - 1);
     const auto change = [&](const Settings& target) {
         if (target.frequency != previous.frequency) {
             if (!Device::Range::Contains(deviceCapabilities.frequencyRanges, target.frequency)) {
@@ -120,19 +139,21 @@ Result Stream::update(const Settings& settings) {
             resolveGain(target.gain, appliedSettings.gainRange) != appliedSettings.gain) {
             JST_CHECK(setGain(target.gain));
         }
-        if (target.receiveChannels == 2 &&
-            (target.automaticGain2 != previous.automaticGain2 ||
-             target.gain2 != previous.gain2 ||
-             resolveGain(target.gain2, appliedSettings.gainRange2) !=
-                 appliedSettings.gain2)) {
-            JST_CHECK(setSecondGain(target.automaticGain2, target.gain2));
+        for (U64 i = 0; i < target.additionalGains.size(); ++i) {
+            const auto& gain = target.additionalGains[i];
+            const auto& old = previous.additionalGains[i];
+            const auto& applied = appliedSettings.additionalGains[i];
+            if (gain.automatic != old.automatic || gain.gain != old.gain ||
+                resolveGain(gain.gain, applied.range) != applied.gain) {
+                JST_CHECK(setChannelGain(i + 1, gain.automatic, gain.gain));
+            }
         }
         if (target.settlingTime != previous.settlingTime) {
             JST_CHECK(setSettlingTime(target.settlingTime));
         }
         return Result::SUCCESS;
     };
-    const auto result = change(settings);
+    const auto result = change(normalized);
     return result == Result::SUCCESS ? result : restore(previous, result);
 }
 

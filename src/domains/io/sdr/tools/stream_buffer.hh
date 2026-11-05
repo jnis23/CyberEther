@@ -5,6 +5,8 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <vector>
 
 #include "jetstream/macros.hh"
 #include "jetstream/tools/circular_buffer.hh"
@@ -33,12 +35,12 @@ class JETSTREAM_API StreamBuffer {
     void reset(const Metadata& metadata);
     bool push(U64 generation, const CF32* data, U64 count,
               std::optional<U64> timestamp = std::nullopt, U64 epoch = 0);
-    bool push(U64 generation, const CF32* data, const CF32* data2, U64 count,
+    bool push(U64 generation, std::span<const CF32* const> data, U64 count,
               std::optional<U64> timestamp = std::nullopt, U64 epoch = 0);
     void split(U64 generation);
     Result pop(CF32* data, U64 count, Metadata& metadata);
 
-    Result pop(CF32* data, CF32* data2, U64 count, Metadata& metadata);
+    Result pop(std::span<CF32* const> data, U64 count, Metadata& metadata);
 
     Metadata metadata() const;
     U64 size() const;
@@ -51,9 +53,7 @@ class JETSTREAM_API StreamBuffer {
     void prune();
 
     mutable std::mutex mutex;
-    Tools::CircularBuffer<CF32> samples;
-    Tools::CircularBuffer<CF32> samples2;
-    U64 channels = 1;
+    std::vector<Tools::CircularBuffer<CF32>> samples{1};
     Metadata current;
     Statistics accumulated;
     U64 written = 0;

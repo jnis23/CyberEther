@@ -52,7 +52,7 @@ TEST_CASE("bladeRF ownership excludes competing stream and sweep handles",
 }
 
 TEST_CASE("bladeRF dual IQ conversion preserves channel order and signed values",
-          "[devices][sdr][bladerf][dual-rx]") {
+          "[devices][sdr][bladerf][multi-channel]") {
     const std::array<I16, 12> raw{2047, -2048, 1024, -1024, 0, 204, -100, 512,
                                  -512, 256, 2048, 0};
     std::array<CF32, 3> first;
@@ -67,7 +67,7 @@ TEST_CASE("bladeRF dual IQ conversion preserves channel order and signed values"
 }
 
 TEST_CASE("dual RX queues discard and overwrite complete channel pairs",
-          "[devices][sdr][bladerf][dual-rx][buffer]") {
+          "[devices][sdr][bladerf][multi-channel][buffer]") {
     Radio::StreamBuffer queue;
     REQUIRE(queue.resize(6, 2) == Result::SUCCESS);
     queue.reset({.frequency = 100.0e6, .sampleRate = 2.0e6, .generation = 1});
@@ -78,44 +78,59 @@ TEST_CASE("dual RX queues discard and overwrite complete channel pairs",
     std::array<CF32, 4> b;
 
     SECTION("overflow keeps the latest pairs and counts each pair once") {
-        REQUIRE(queue.push(1, first.data(), second.data(), 8, 0, 1));
+        REQUIRE(queue.push(1, std::array<const CF32*, 2>{first.data(), second.data()},
+                           8, 0, 1));
         REQUIRE(queue.statistics().pushedSamples == 8);
         REQUIRE(queue.statistics().overwrittenSamples == 2);
-        REQUIRE(queue.pop(a.data(), b.data(), 4, metadata) == Result::SUCCESS);
+        REQUIRE(queue.pop(std::array<CF32*, 2>{a.data(), b.data()}, 4, metadata) ==
+                Result::SUCCESS);
         REQUIRE(a == std::array<CF32, 4>{2, 3, 4, 5});
         REQUIRE(b == std::array<CF32, 4>{102, 103, 104, 105});
     }
     SECTION("timestamp gaps discard both partial frames together") {
-        REQUIRE(queue.push(1, first.data(), second.data(), 2, 0, 1));
-        REQUIRE(queue.push(1, first.data() + 2, second.data() + 2, 4, 10, 1));
-        REQUIRE(queue.pop(a.data(), b.data(), 4, metadata) == Result::SUCCESS);
+        REQUIRE(queue.push(1, std::array<const CF32*, 2>{first.data(), second.data()},
+                           2, 0, 1));
+        REQUIRE(queue.push(
+            1, std::array<const CF32*, 2>{first.data() + 2, second.data() + 2}, 4, 10,
+            1));
+        REQUIRE(queue.pop(std::array<CF32*, 2>{a.data(), b.data()}, 4, metadata) ==
+                Result::SUCCESS);
         REQUIRE(a == std::array<CF32, 4>{2, 3, 4, 5});
         REQUIRE(b == std::array<CF32, 4>{102, 103, 104, 105});
         REQUIRE(queue.statistics().discardedSamples == 2);
     }
     SECTION("retunes reject old captures for both channels") {
-        REQUIRE(queue.push(1, first.data(), second.data(), 2, 0, 1));
+        REQUIRE(queue.push(1, std::array<const CF32*, 2>{first.data(), second.data()},
+                           2, 0, 1));
         queue.reset({.frequency = 200.0e6, .sampleRate = 4.0e6, .generation = 2});
-        REQUIRE_FALSE(queue.push(1, first.data(), second.data(), 4, 2, 1));
+        REQUIRE_FALSE(queue.push(
+            1, std::array<const CF32*, 2>{first.data(), second.data()}, 4, 2, 1));
         REQUIRE(queue.size() == 0);
-        REQUIRE(queue.push(2, first.data() + 4, second.data() + 4, 4, 100, 2));
-        REQUIRE(queue.pop(a.data(), b.data(), 4, metadata) == Result::SUCCESS);
+        REQUIRE(queue.push(
+            2, std::array<const CF32*, 2>{first.data() + 4, second.data() + 4}, 4, 100,
+            2));
+        REQUIRE(queue.pop(std::array<CF32*, 2>{a.data(), b.data()}, 4, metadata) ==
+                Result::SUCCESS);
         REQUIRE(a == std::array<CF32, 4>{4, 5, 6, 7});
         REQUIRE(b == std::array<CF32, 4>{104, 105, 106, 107});
         REQUIRE(metadata.frequency == 200.0e6);
         REQUIRE(metadata.sampleRate == 4.0e6);
     }
     SECTION("explicit discontinuities cannot join partial frames") {
-        REQUIRE(queue.push(1, first.data(), second.data(), 2));
+        REQUIRE(
+            queue.push(1, std::array<const CF32*, 2>{first.data(), second.data()}, 2));
         queue.split(1);
-        REQUIRE(queue.push(1, first.data() + 2, second.data() + 2, 4));
-        REQUIRE(queue.pop(a.data(), b.data(), 4, metadata) == Result::SUCCESS);
+        REQUIRE(queue.push(
+            1, std::array<const CF32*, 2>{first.data() + 2, second.data() + 2}, 4));
+        REQUIRE(queue.pop(std::array<CF32*, 2>{a.data(), b.data()}, 4, metadata) ==
+                Result::SUCCESS);
         REQUIRE(a == std::array<CF32, 4>{2, 3, 4, 5});
         REQUIRE(b == std::array<CF32, 4>{102, 103, 104, 105});
     }
     SECTION("single-channel access cannot partially consume a pair") {
         REQUIRE_FALSE(queue.push(1, first.data(), 4));
-        REQUIRE(queue.push(1, first.data(), second.data(), 4));
+        REQUIRE(
+            queue.push(1, std::array<const CF32*, 2>{first.data(), second.data()}, 4));
         REQUIRE(queue.pop(a.data(), 4, metadata) == Result::ERROR);
         REQUIRE(queue.size() == 4);
     }
@@ -124,7 +139,7 @@ TEST_CASE("dual RX queues discard and overwrite complete channel pairs",
 TEST_CASE_METHOD(
     TestRadio::ScriptedDrivers,
     "dual RX streams read one synchronized capture and apply independent gains",
-    "[devices][sdr][bladerf][dual-rx][stream]") {
+    "[devices][sdr][bladerf][multi-channel][stream]") {
     TestRadio::TestScript().receiveChannels = 2;
     TestRadio::TestScript().counter = true;
     TestRadio::TestScript().readLimit = 3;
@@ -132,10 +147,11 @@ TEST_CASE_METHOD(
     REQUIRE(Radio::Stream::Open(TestRadio::Selector, stream) == Result::SUCCESS);
     Radio::Stream::Settings settings;
     settings.receiveChannels = 2;
+    settings.additionalGains.resize(1);
     settings.automaticGain = false;
     settings.gain = 12.0;
-    settings.automaticGain2 = false;
-    settings.gain2 = 19.0;
+    settings.additionalGains[0].automatic = false;
+    settings.additionalGains[0].gain = 19.0;
     REQUIRE(stream->start(settings) == Result::SUCCESS);
     std::array<CF32, 8> a;
     std::array<CF32, 8> b;
@@ -149,22 +165,22 @@ TEST_CASE_METHOD(
         REQUIRE(b[i] == -a[i]);
     }
     const auto generation = stream->generation();
-    settings.gain2 = 25.0;
+    settings.additionalGains[0].gain = 25.0;
     REQUIRE(stream->update(settings) == Result::SUCCESS);
     REQUIRE(stream->generation() == generation);
     REQUIRE(stream->applied().gain == 12.0);
-    REQUIRE(stream->applied().gain2 == 25.0);
-    settings.automaticGain2 = true;
+    REQUIRE(stream->applied().additionalGains[0].gain == 25.0);
+    settings.additionalGains[0].automatic = true;
     REQUIRE(stream->update(settings) == Result::SUCCESS);
     REQUIRE_FALSE(stream->applied().automaticGain);
-    REQUIRE(stream->applied().automaticGain2);
+    REQUIRE(stream->applied().additionalGains[0].automatic);
 
     TestRadio::TestScript().failAt = "gain2:35";
-    settings.gain2 = 35.0;
+    settings.additionalGains[0].gain = 35.0;
     REQUIRE(stream->update(settings) == Result::ERROR);
     REQUIRE(stream->applied().gain == 12.0);
-    REQUIRE(stream->applied().gain2 == 25.0);
-    REQUIRE(stream->settings().gain2 == 25.0);
+    REQUIRE(stream->applied().additionalGains[0].gain == 25.0);
+    REQUIRE(stream->settings().additionalGains[0].gain == 25.0);
     REQUIRE(stream->generation() > generation);
     capture = stream->readChannels(destinations, std::chrono::milliseconds(50));
     REQUIRE(capture.status == Radio::Device::Status::Samples);
@@ -176,17 +192,62 @@ TEST_CASE_METHOD(
 
 TEST_CASE_METHOD(
     TestRadio::ScriptedDrivers,
-    "single RX streams reject Dual RX settings and keep the legacy read path",
-    "[devices][sdr][bladerf][dual-rx][compatibility]") {
+    "single RX streams reject multi-channel settings and keep the legacy read path",
+    "[devices][sdr][bladerf][multi-channel][compatibility]") {
     std::unique_ptr<Radio::Stream> stream;
     REQUIRE(Radio::Stream::Open(TestRadio::Selector, stream) == Result::SUCCESS);
     Radio::Stream::Settings settings;
     settings.receiveChannels = 2;
+    settings.additionalGains.resize(1);
     REQUIRE(stream->start(settings) == Result::ERROR);
     settings.receiveChannels = 1;
+    settings.additionalGains.clear();
     REQUIRE(stream->start(settings) == Result::SUCCESS);
     std::array<CF32, 4> a;
     std::array<std::span<CF32>, 1> destinations{a};
     REQUIRE(stream->readChannels(destinations, std::chrono::milliseconds(50)).count ==
             4);
+}
+
+TEST_CASE("multi-channel queues preserve every channel through overflow and gaps",
+          "[devices][sdr][multi-channel][buffer]") {
+    Radio::StreamBuffer queue;
+    REQUIRE(queue.resize(6, 4) == Result::SUCCESS);
+    queue.reset({.generation = 1});
+    std::array<std::array<CF32, 8>, 4> input;
+    std::array<std::array<CF32, 4>, 4> output;
+    std::array<const CF32*, 4> sources;
+    std::array<CF32*, 4> destinations;
+    for (U64 channel = 0; channel < 4; ++channel) {
+        for (U64 i = 0; i < 8; ++i) {
+            input[channel][i] = static_cast<F32>(channel * 100 + i);
+        }
+        sources[channel] = input[channel].data();
+        destinations[channel] = output[channel].data();
+    }
+    Radio::StreamBuffer::Metadata metadata;
+    REQUIRE(queue.push(1, sources, 8, 0));
+    REQUIRE(queue.statistics().pushedSamples == 8);
+    REQUIRE(queue.statistics().overwrittenSamples == 2);
+    REQUIRE(queue.pop(destinations, 4, metadata) == Result::SUCCESS);
+    for (U64 channel = 0; channel < 4; ++channel) {
+        REQUIRE(output[channel][0] == static_cast<F32>(channel * 100 + 2));
+        REQUIRE(output[channel][3] == static_cast<F32>(channel * 100 + 5));
+    }
+    // Two old samples remain; a timestamp jump discards them for every channel.
+    REQUIRE(queue.push(1, sources, 4, 20));
+    REQUIRE(queue.pop(destinations, 4, metadata) == Result::SUCCESS);
+    REQUIRE(queue.statistics().discardedSamples == 2);
+    for (U64 channel = 0; channel < 4; ++channel) {
+        REQUIRE(output[channel][0] == static_cast<F32>(channel * 100));
+    }
+    REQUIRE(queue.push(1, sources, 4));
+    destinations[3] = nullptr;
+    REQUIRE(queue.pop(destinations, 4, metadata) == Result::ERROR);
+    REQUIRE(queue.size() == 4);
+    sources[3] = nullptr;
+    REQUIRE_FALSE(queue.push(1, sources, 2));
+    REQUIRE(queue.size() == 4);
+    REQUIRE(queue.resize(6, 0) == Result::ERROR);
+    REQUIRE(queue.size() == 4);
 }

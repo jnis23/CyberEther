@@ -24,6 +24,8 @@
 #include "domains/io/sdr/tools/stream_buffer.hh"
 #include "domains/io/sdr/tools/timestamp_filter.hh"
 #include "flowgraph_fixture.hh"
+#include "jetstream/domains/core/slice/module.hh"
+#include "jetstream/domains/core/slice/block.hh"
 #include "jetstream/domains/io/sdr/block.hh"
 #include "jetstream/domains/io/sdr/module.hh"
 #include "jetstream/memory/axis.hh"
@@ -1574,6 +1576,19 @@ TEST_CASE_METHOD(ScriptedDrivers,
     config = ScriptedConfig();
     config.bufferMultiplier = std::numeric_limits<U64>::max();
     check(config);
+    config = ScriptedConfig();
+    config.channels = 0;
+    check(config);
+    config = ScriptedConfig();
+    config.channels = std::numeric_limits<U64>::max();
+    check(config);
+    config = ScriptedConfig();
+    config.channels = 2;
+    config.manualGains = {10.0f, std::numeric_limits<F32>::infinity()};
+    check(config);
+    config.manualGains.clear();
+    config.automaticGains = {0, 2};
+    check(config);
     REQUIRE(TestScript().opens == 0);
 }
 
@@ -1611,6 +1626,7 @@ TEST_CASE_METHOD(ScriptedDrivers,
     REQUIRE(ResolveSignalAxes(output, axes) == Result::SUCCESS);
     REQUIRE(axes.sample == Index{1});
     REQUIRE(axes.batch == Index{0});
+    REQUIRE_FALSE(axes.channel.has_value());
     REQUIRE(AttributeOf(output, "frequency") == 100.0e6f);
     REQUIRE(AttributeOf(output, "sampleRate") == static_cast<F32>(2.0e6 + 125.0));
     REQUIRE(module->getImpl<Modules::SdrImpl>()->listAntennas() ==
@@ -2087,63 +2103,105 @@ TEST_CASE_METHOD(ScriptedFlowgraph,
     REQUIRE(TestScript().opens == 1);
 }
 
-TEST_CASE_METHOD(
-    ScriptedDrivers,
-    "Dual RX modules publish aligned outputs across retunes and rate changes",
-    "[modules][sdr][dual-rx]") {
-    TestScript().receiveChannels = 2;
+TEST_CASE_METHOD(ScriptedDrivers,
+                 "Multi-channel SDR tensors slice into aligned receiver streams",
+                 "[modules][sdr][multi-channel]") {
+    TestScript().receiveChannels = 3;
+    TestScript().readLimit = 3;
     TestScript().counter = true;
     TestScript().budget = 12;
     auto config = ScriptedConfig();
-    config.dualRx = true;
-    config.automaticGain = false;
-    config.manualGain = 12.0f;
-    config.automaticGain2 = false;
-    config.manualGain2 = 19.0f;
+    config.channels = 3;
+    config.automaticGains = {0, 0, 0};
+    config.manualGains = {12.0f, 19.0f, 23.0f};
     const auto module = BuildSdrModule();
     const ModuleCleanup cleanup{module};
-    REQUIRE(module->create("dual", config, {}) == Result::SUCCESS);
+    REQUIRE(module->create("multi", config, {}) == Result::SUCCESS);
     auto* sdr = module->getImpl<Modules::SdrImpl>();
     const auto& queue = sdr->*SdrImplAccess::streamMember();
     const auto runtime = RuntimeOf(module);
-    const auto& first = module->outputs().at("signal").tensor;
-    const auto& second = module->outputs().at("signal2").tensor;
-    REQUIRE(first.shape() == second.shape());
-    REQUIRE(second.shape() == Shape{1, 8});
-    REQUIRE(sdr->getGainRange(true)->minimum == 5.0);
+    const auto& output = module->outputs().at("signal").tensor;
+    REQUIRE(module->outputs().size() == 1);
+    REQUIRE(output.shape() == Shape{3, 1, 8});
+    SignalAxes axes;
+    REQUIRE(ResolveSignalAxes(output, axes) == Result::SUCCESS);
+    REQUIRE(axes.channel == 0);
+    REQUIRE(axes.batch == 1);
+    REQUIRE(axes.sample == 2);
+    REQUIRE(sdr->getGainRange(1)->minimum == 5.0);
     REQUIRE(sdr->getApplied().gain == 12.0);
-    REQUIRE(sdr->getApplied().gain2 == 19.0);
+    REQUIRE(sdr->getApplied().additionalGains[0].gain == 19.0);
+    REQUIRE(sdr->getApplied().additionalGains[1].gain == 23.0);
 
+    std::vector<std::shared_ptr<Module>> slices;
+    for (U64 channel = 0; channel < config.channels; ++channel) {
+        std::shared_ptr<Module> slice;
+        REQUIRE(Registry::BuildModule("slice", DeviceType::CPU, RuntimeType::NATIVE,
+                                      "generic", slice) == Result::SUCCESS);
+        Modules::Slice selection;
+        selection.slice = jst::fmt::format("[{}, ...]", channel);
+        REQUIRE(slice->create("rx", selection,
+                              {{"buffer", module->outputs().at("signal")}}) ==
+                Result::SUCCESS);
+        const auto& selected = slice->outputs().at("buffer").tensor;
+        REQUIRE(selected.shape() == Shape{1, 8});
+        REQUIRE(selected.contiguous());
+        REQUIRE(selected.data<CF32>() == output.data<CF32>() + channel * 8);
+        REQUIRE(ResolveSignalAxes(selected, axes) == Result::SUCCESS);
+        REQUIRE_FALSE(axes.channel.has_value());
+        REQUIRE(axes.batch == 0);
+        REQUIRE(axes.sample == 1);
+        slices.push_back(slice);
+    }
     const auto checkFrame = [&] {
         REQUIRE(WaitFor([&] { return queue.size() >= 8; }));
+        auto* scheduler = dynamic_cast<Scheduler::Context*>(sdr);
+        REQUIRE(scheduler->hasPendingCompute() == Result::SUCCESS);
         REQUIRE(runtime->computeSubmit() == Result::SUCCESS);
-        for (U64 i = 0; i < first.size(); ++i) {
-            REQUIRE(second.data<CF32>()[i] == -first.data<CF32>()[i]);
+        for (U64 channel = 1; channel < config.channels; ++channel) {
+            const auto& selected = slices[channel]->outputs().at("buffer").tensor;
+            for (U64 i = 0; i < 8; ++i) {
+                REQUIRE(selected.data<CF32>()[i] ==
+                        -static_cast<F32>(channel) * output.data<CF32>()[i]);
+            }
+            REQUIRE(AttributeOf(selected, "frequency") ==
+                    AttributeOf(output, "frequency"));
+            REQUIRE(AttributeOf(selected, "sampleRate") ==
+                    AttributeOf(output, "sampleRate"));
         }
-        REQUIRE(AttributeOf(first, "frequency") == AttributeOf(second, "frequency"));
-        REQUIRE(AttributeOf(first, "sampleRate") == AttributeOf(second, "sampleRate"));
     };
     checkFrame();
-    REQUIRE(WaitFor([&] { return sdr->getThroughput().second == 32.0f; }));
+    REQUIRE(WaitFor([&] { return sdr->getThroughput().second == 48.0f; }));
     REQUIRE(WaitFor([&] { return queue.size() == 4; }));
     REQUIRE(module->reconfigure({{"frequency", F32{250.0e6}}}) == Result::SUCCESS);
     REQUIRE(queue.size() == 0);
     TestScript().budget = 8;
     checkFrame();
-    REQUIRE(AttributeOf(second, "frequency") == 250.0e6f);
+    REQUIRE(AttributeOf(output, "frequency") == 250.0e6f);
     REQUIRE(module->reconfigure({{"sampleRate", F32{4.0e6}}}) == Result::SUCCESS);
     TestScript().budget = 8;
     checkFrame();
-    REQUIRE(AttributeOf(second, "sampleRate") == 4.0e6f);
-    REQUIRE(module->reconfigure({{"manualGain2", F32{25.0}}}) == Result::SUCCESS);
+    REQUIRE(AttributeOf(output, "sampleRate") == 4.0e6f);
+    REQUIRE(module->reconfigure({{"manualGains", std::vector<F32>{12, 25, 23}}}) ==
+            Result::SUCCESS);
     REQUIRE(sdr->getApplied().gain == 12.0);
-    REQUIRE(sdr->getApplied().gain2 == 25.0);
+    REQUIRE(sdr->getApplied().additionalGains[0].gain == 25.0);
+    REQUIRE(sdr->getApplied().additionalGains[1].gain == 23.0);
+    const auto generation = queue.metadata().generation;
+    REQUIRE(module->reconfigure({{"automaticGains", std::vector<U64>{0, 1, 0}}}) ==
+            Result::SUCCESS);
+    REQUIRE(queue.metadata().generation == generation);
+    REQUIRE_FALSE(sdr->getApplied().automaticGain);
+    REQUIRE(sdr->getApplied().additionalGains[0].automatic);
+    REQUIRE_FALSE(sdr->getApplied().additionalGains[1].automatic);
+    for (const auto& slice : slices) {
+        REQUIRE(slice->destroy() == Result::SUCCESS);
+    }
 }
 
-TEST_CASE_METHOD(
-    ScriptedFlowgraph,
-    "Dual RX blocks expose RX2 and preserve its connection through mode changes",
-    "[modules][sdr][dual-rx][block]") {
+TEST_CASE_METHOD(ScriptedFlowgraph,
+                 "SDR channel count changes preserve the single output connection",
+                 "[modules][sdr][multi-channel][block]") {
     TestScript().receiveChannels = 2;
     TestScript().budget = 0;
     Blocks::Sdr config;
@@ -2152,61 +2210,74 @@ TEST_CASE_METHOD(
     config.numberOfTimeSamples = 8;
     REQUIRE(flowgraph->blockCreate("radio", config, {}) == Result::SUCCESS);
     REQUIRE(viewBlock("radio").state == Block::State::Created);
-    auto block = viewBlock("radio");
-    REQUIRE(std::any_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
-                        [](const auto& field) { return field.name == "dualRx"; }));
-    REQUIRE_FALSE(block.outputs.contains("signal2"));
-    REQUIRE(flowgraph->blockReconfigure(
-                "radio", {{"dualRx", true}, {"automaticGain2", false}}) ==
+    REQUIRE(viewBlock("radio").outputs.at("signal").tensor.shape() == Shape{1, 8});
+    REQUIRE(flowgraph->blockCreate("consumer", "flowgraph_test_pass", {}, {}) ==
             Result::SUCCESS);
-    block = viewBlock("radio");
+    REQUIRE(flowgraph->blockConnect("consumer", "buffer", "radio", "signal") ==
+            Result::SUCCESS);
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"channels", U64{2}}}) ==
+            Result::SUCCESS);
+    auto block = viewBlock("radio");
     REQUIRE(block.state == Block::State::Created);
-    REQUIRE(block.outputs.contains("signal"));
-    REQUIRE(block.outputs.contains("signal2"));
+    REQUIRE(block.outputs.size() == 1);
+    REQUIRE(block.outputs.at("signal").tensor.shape() == Shape{2, 1, 8});
     REQUIRE(std::none_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
                          [](const auto& field) { return field.name == "antenna"; }));
     REQUIRE(std::any_of(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
-                        [](const auto& field) { return field.name == "manualGain2"; }));
-    const auto rx2Gain =
-        std::find_if(block.interfaceConfigs.begin(), block.interfaceConfigs.end(),
-                     [](const auto& field) { return field.name == "manualGain2"; });
-    REQUIRE(rx2Gain != block.interfaceConfigs.end());
-    REQUIRE(Parser::Get<F32>(rx2Gain->format, "min") == 5.0f);
-    REQUIRE(Parser::Get<F32>(rx2Gain->format, "max") == 55.0f);
-    REQUIRE(flowgraph->blockCreate("consumer", "flowgraph_test_pass", {}, {}) ==
-            Result::SUCCESS);
-    REQUIRE(flowgraph->blockConnect("consumer", "buffer", "radio", "signal2") ==
-            Result::SUCCESS);
+                        [](const auto& field) { return field.name == "manualGains"; }));
     REQUIRE(viewBlock("consumer").state == Block::State::Created);
-    REQUIRE(flowgraph->blockReconfigure("radio", {{"dualRx", false}}) ==
+    REQUIRE(viewBlock("consumer").inputs.at("buffer").tensor.shape() == Shape{2, 1, 8});
+    REQUIRE(flowgraph->blockReconfigure("radio",
+                                        {{"automaticGains", std::vector<U64>{0, 1}},
+                                         {"manualGains", std::vector<F32>{10, 25}}}) ==
             Result::SUCCESS);
-    REQUIRE_FALSE(viewBlock("radio").outputs.contains("signal2"));
-    REQUIRE(viewBlock("consumer").state != Block::State::Created);
-    REQUIRE(viewBlock("consumer").inputs.contains("buffer"));
-    REQUIRE(flowgraph->blockReconfigure("radio", {{"dualRx", true}}) ==
+    Blocks::Slice selection;
+    selection.slice = "[1, ...]";
+    REQUIRE(flowgraph->blockCreate("select_rx2", selection, {}) == Result::SUCCESS);
+    REQUIRE(flowgraph->blockConnect("select_rx2", "buffer", "radio", "signal") ==
             Result::SUCCESS);
-    REQUIRE(viewBlock("radio").state == Block::State::Created);
+    REQUIRE(viewBlock("select_rx2").state == Block::State::Created);
+    REQUIRE(viewBlock("select_rx2").outputs.at("buffer").tensor.shape() == Shape{1, 8});
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"channels", U64{1}}}) ==
+            Result::SUCCESS);
+    REQUIRE(viewBlock("radio").outputs.at("signal").tensor.shape() == Shape{1, 8});
     REQUIRE(viewBlock("consumer").state == Block::State::Created);
+    REQUIRE(viewBlock("consumer").inputs.at("buffer").tensor.shape() == Shape{1, 8});
+    REQUIRE(Parser::Get<std::vector<U64>>(viewBlock("radio").config,
+                                          "automaticGains") == std::vector<U64>{0});
+    REQUIRE(Parser::Get<std::vector<F32>>(viewBlock("radio").config,
+                                          "manualGains") == std::vector<F32>{10});
+    REQUIRE(viewBlock("select_rx2").state != Block::State::Created);
+    REQUIRE(flowgraph->blockReconfigure("radio", {{"channels", U64{2}}}) ==
+            Result::SUCCESS);
+    REQUIRE(Parser::Get<std::vector<U64>>(viewBlock("radio").config,
+                                          "automaticGains") == std::vector<U64>{0, 1});
+    REQUIRE(Parser::Get<std::vector<F32>>(viewBlock("radio").config,
+                                          "manualGains") == std::vector<F32>{10, 30});
+    REQUIRE(viewBlock("select_rx2").state == Block::State::Created);
+    REQUIRE(viewBlock("select_rx2").outputs.at("buffer").tensor.shape() == Shape{1, 8});
 }
 
 TEST_CASE_METHOD(ScriptedDrivers,
-                 "Dual RX configuration fails clearly on single RX radios",
-                 "[modules][sdr][dual-rx][compatibility]") {
+                 "Multi-channel configuration fails clearly on single RX radios",
+                 "[modules][sdr][multi-channel][compatibility]") {
     auto config = ScriptedConfig();
-    config.dualRx = true;
+    config.channels = 2;
     const auto module = BuildSdrModule();
     REQUIRE(module->create("dual", config, {}) == Result::ERROR);
-    REQUIRE(JST_LOG_LAST_ERROR().find("does not support Dual RX") != std::string::npos);
+    REQUIRE(JST_LOG_LAST_ERROR().find("supports 1 receive channels") !=
+            std::string::npos);
     REQUIRE(module->state() == Module::State::DESTROYED);
 }
 
-TEST_CASE_METHOD(ScriptedDrivers,
-                 "Dual RX startup failures release the radio and shared antenna power",
-                 "[modules][sdr][dual-rx][lifecycle]") {
+TEST_CASE_METHOD(
+    ScriptedDrivers,
+    "Multi-channel startup failures release the radio and shared antenna power",
+    "[modules][sdr][multi-channel][lifecycle]") {
     TestScript().receiveChannels = 2;
     TestScript().failAt = "gain2:30";
     auto config = ScriptedConfig();
-    config.dualRx = true;
+    config.channels = 2;
     config.biasTee = true;
     const auto module = BuildSdrModule();
     REQUIRE(module->create("dual", config, {}) == Result::ERROR);
@@ -2218,12 +2289,12 @@ TEST_CASE_METHOD(ScriptedDrivers,
 }
 
 TEST_CASE_METHOD(ScriptedDrivers,
-                 "Dual RX device disconnection stops both outputs",
-                 "[modules][sdr][dual-rx][lifecycle]") {
+                 "Multi-channel device disconnection stops both outputs",
+                 "[modules][sdr][multi-channel][lifecycle]") {
     TestScript().receiveChannels = 2;
     TestScript().budget = 0;
     auto config = ScriptedConfig();
-    config.dualRx = true;
+    config.channels = 2;
     const auto module = BuildSdrModule();
     const ModuleCleanup cleanup{module};
     REQUIRE(module->create("dual", config, {}) == Result::SUCCESS);
@@ -2235,5 +2306,27 @@ TEST_CASE_METHOD(ScriptedDrivers,
     const auto runtime = RuntimeOf(module);
     REQUIRE(WaitFor([&] { return runtime->computeSubmit() == Result::ERROR; }));
     REQUIRE(module->outputs().contains("signal"));
-    REQUIRE(module->outputs().contains("signal2"));
+    REQUIRE(module->outputs().size() == 1);
+}
+
+TEST_CASE_METHOD(ScriptedDrivers,
+                 "Multi-channel gain defaults retain their request across retunes",
+                 "[modules][sdr][multi-channel][gain]") {
+    TestScript().receiveChannels = 2;
+    TestScript().budget = 0;
+    auto config = ScriptedConfig();
+    config.channels = 2;
+    config.automaticGain = false;
+    config.manualGain = 100.0f;
+    const auto module = BuildSdrModule();
+    const ModuleCleanup cleanup{module};
+    REQUIRE(module->create("multi", config, {}) == Result::SUCCESS);
+    auto* sdr = module->getImpl<Modules::SdrImpl>();
+    REQUIRE(sdr->manualGain == 100.0f);
+    REQUIRE(sdr->getApplied().gain == 60.0);
+    REQUIRE(sdr->getApplied().additionalGains[0].gain == 55.0);
+    REQUIRE(module->reconfigure({{"frequency", F32{250.0e6}}}) == Result::SUCCESS);
+    REQUIRE(sdr->manualGain == 100.0f);
+    REQUIRE(sdr->getApplied().gain == 60.0);
+    REQUIRE(sdr->getApplied().additionalGains[0].gain == 55.0);
 }
