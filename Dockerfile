@@ -18,8 +18,9 @@ RUN apt-get update --fix-missing && \
 RUN python3 -m pip install --break-system-packages meson ninja numpy
 
 FROM build-tools AS linux-binary-build
+# Use Ubuntu's GUdev so the final link and the exported binary resolve the same SONAME.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends patchelf && \
+    apt-get install -y --no-install-recommends libgudev-1.0-dev patchelf && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
