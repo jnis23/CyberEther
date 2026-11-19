@@ -47,6 +47,7 @@ CyberEther runs on macOS, Linux, Windows, iOS/iPadOS, Android, Raspberry Pi, and
 - [**Pre-built Binaries**](https://github.com/luigifcruz/CyberEther/releases): Download official releases for Linux (AppImage & tar.gz), Windows (MSI), and macOS (PKG).
 - [**Try Online**](https://cyberether.org/web): Run the browser build powered by **WebAssembly** and **WebGPU**.
 - [**Build From Source**](https://cyberether.org/docs/installation): Follow the dependency and build guide for custom builds or unsupported platforms.
+- [**Build a Linux x86-64 Binary in Docker**](docs/installation.md#build-a-linux-x86-64-binary-in-a-container): Build this checkout and extract the executable for native use.
 
 ## FAQ
 

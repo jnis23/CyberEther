@@ -1,0 +1,15 @@
+.git
+.agents
+.aws
+.codex
+.cache
+.build
+.dist
+build
+build-*
+builddir
+**/.DS_Store
+**/__pycache__
+subprojects/*
+!subprojects/*.wrap
+!subprojects/packagefiles

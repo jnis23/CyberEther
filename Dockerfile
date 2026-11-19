@@ -1,5 +1,5 @@
-ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+FROM ${BASE_IMAGE} AS build-tools
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update --fix-missing && \
@@ -17,6 +17,39 @@ RUN apt-get update --fix-missing && \
 
 RUN python3 -m pip install --break-system-packages meson ninja numpy
 
+FROM build-tools AS linux-binary-build
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends patchelf && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . .
+
+ARG BUILD_JOBS=2
+RUN meson setup build \
+      --force-fallback-for=libffi,openssl \
+      --default-library=shared \
+      -Dlibffi:default_library=static \
+      -Dopenssl:default_library=static \
+      -Dbuildtype=release \
+      -Dexamples=false \
+      -Dtests=false \
+      -Dremote=enabled \
+      -Dinference=disabled && \
+    meson compile -C build -j "${BUILD_JOBS}" cyberether && \
+    install -Dm755 build/cyberether /bundle/cyberether && \
+    install -Dm755 build/libjetstream.so /bundle/libjetstream.so && \
+    patchelf --set-soname libjetstream.so /bundle/libjetstream.so && \
+    needed="$(patchelf --print-needed /bundle/cyberether | awk '/(^|\/)libjetstream\.so$/ { print; exit }')" && \
+    test -n "$needed" && \
+    patchelf --replace-needed "$needed" libjetstream.so --set-rpath '$ORIGIN' /bundle/cyberether && \
+    /bundle/cyberether --version
+
+FROM scratch AS linux-binary
+COPY --from=linux-binary-build /bundle/ /bundle/
+CMD ["/bundle/cyberether"]
+
+FROM build-tools AS container
 ARG ONNXRUNTIME_VERSION=1.27.0
 ARG ONNXRUNTIME_CUDA_MAJOR=13
 # Callout: upstream ONNX Runtime publishes Linux CUDA binaries for x86_64 but

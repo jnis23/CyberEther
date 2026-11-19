@@ -28,6 +28,33 @@ docker pull ghcr.io/luigifcruz/cyberether:ubuntu24-aarch64-cuda
 
 The CUDA container images include the CUDA 13 user-space libraries, but still require a compatible NVIDIA driver and NVIDIA Container Toolkit on the host. Run them with GPU access enabled, for example `docker run --gpus all ...`.
 
+## Build a Linux x86-64 Binary in a Container
+
+On an x86-64 Linux machine with Docker running, execute these commands from your checkout:
+
+```bash
+./apps/linux/container-build.sh
+```
+
+The script builds a release from your checkout using Ubuntu 24.04 and exports `cyberether` and `libjetstream.so`. The first build downloads the toolchain and source dependencies and needs several gigabytes of free container storage. Keep the exported files together when moving them. The build includes Vulkan and remote streaming. CUDA and optional ONNX inference are disabled.
+
+Run the binary on Ubuntu 24.04 x86-64 or a distribution with compatible system libraries. On a minimal Ubuntu 24.04 host, install the runtime libraries and desktop file picker with:
+
+```bash
+sudo apt install libstdc++6 libatomic1 libvulkan1 libudev1 libgudev-1.0-0 \
+                 libgl1 libegl1 libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 \
+                 libxkbcommon0 libwayland-client0 libwayland-cursor0 libwayland-egl1 zenity
+```
+
+The desktop app needs a graphical session and a Vulkan driver for your GPU, such as `mesa-vulkan-drivers` for Mesa-supported GPUs. Check the binary, then launch it directly:
+
+```bash
+./.dist/linux-x86_64/cyberether --version
+./.dist/linux-x86_64/cyberether
+```
+
+You can pass an output directory as the first argument, set `BUILD_JOBS` to change the number of parallel compile jobs, or use `CONTAINER_ENGINE=podman` to build with Podman.
+
 ## Build From Source
 
 CyberEther requires a C++20 compiler (GCC 11+ or Clang 14+), [Meson](https://mesonbuild.com) 1.11+, and [Ninja](https://ninja-build.org). Most third-party libraries are bundled as Meson subprojects, so the packages below focus on the platform toolchain, graphics headers or SDKs, shader tools, and Python modules used during resource generation.
